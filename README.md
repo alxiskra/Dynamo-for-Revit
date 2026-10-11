@@ -1,2 +1,1 @@
-<img width="2366" height="1176" alt="создать рабочий набор" src="https://github.com/user-attachments/assets/27aa4dcf-5823-4472-a270-7bc3cfe185c4" />
-
+https://github.com/user-attachments/assets/772daa7c-8972-4221-a905-97c382da85fb
