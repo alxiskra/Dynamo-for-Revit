@@ -20,7 +20,8 @@ from Autodesk.Revit.DB import (
 from RevitServices.Persistence import DocumentManager
 from RevitServices.Transactions import TransactionManager
 from System.Windows.Forms import (
-    Form, CheckedListBox, Button, DialogResult, FormBorderStyle, FormStartPosition
+    Form, CheckedListBox, Button, DialogResult, FormBorderStyle, FormStartPosition,
+    TextBox, CheckState, Control, Keys
 )
 from System.Drawing import Size, Point
 
@@ -30,7 +31,7 @@ doc = DocumentManager.Instance.CurrentDBDocument
 worksets = list(FilteredWorksetCollector(doc).OfKind(WorksetKind.UserWorkset))
 workset_dict = {ws.Name: ws for ws in worksets}
 
-# Окно выбора рабочих наборов
+# Окно выбора рабочих наборов с поиском и поддержкой SHIFT
 class WorksetSelectorForm(Form):
     def __init__(self, names):
         self.Text = "Выбор рабочих наборов для 3D видов"
@@ -40,12 +41,21 @@ class WorksetSelectorForm(Form):
         self.MaximizeBox = False
         self.MinimizeBox = False
 
+        self.all_names = sorted(names)
+        self.item_states = {name: False for name in self.all_names}
+        self.last_clicked_index = -1
+
+        self.tb_search = TextBox()
+        self.tb_search.Location = Point(15, 15)
+        self.tb_search.Size = Size(405, 20)
+        self.tb_search.TextChanged += self.on_text_changed
+        self.Controls.Add(self.tb_search)
+
         self.clb = CheckedListBox()
-        self.clb.Location = Point(15, 15)
-        self.clb.Size = Size(405, 430)
-        self.clb.CheckOnClick = True
-        for name in sorted(names):
-            self.clb.Items.Add(name)
+        self.clb.Location = Point(15, 45)
+        self.clb.Size = Size(405, 400)
+        self.clb.CheckOnClick = False # Отключаем авто-чек, обрабатываем клики вручную
+        self.clb.MouseClick += self.on_mouse_click
         self.Controls.Add(self.clb)
 
         self.btn_ok = Button()
@@ -65,13 +75,52 @@ class WorksetSelectorForm(Form):
         self.AcceptButton = self.btn_ok
         self.CancelButton = self.btn_cancel
 
+        self.update_list("")
+
+    def update_list(self, filter_text):
+        self.clb.Items.Clear()
+        filter_text = filter_text.lower()
+        for name in self.all_names:
+            if filter_text in name.lower():
+                self.clb.Items.Add(name, self.item_states[name])
+        self.last_clicked_index = -1 
+
+    def on_text_changed(self, sender, event):
+        self.update_list(sender.Text)
+
+    def on_mouse_click(self, sender, event):
+        index = self.clb.IndexFromPoint(event.Location)
+        if index == -1: return
+
+        is_shift_pressed = (Control.ModifierKeys == Keys.Shift)
+        current_state = self.clb.GetItemChecked(index)
+        new_state = not current_state
+
+        if is_shift_pressed and self.last_clicked_index != -1:
+            start = min(self.last_clicked_index, index)
+            end = max(self.last_clicked_index, index)
+            for i in range(start, end + 1):
+                self.clb.SetItemChecked(i, new_state)
+                item_name = self.clb.Items[i]
+                self.item_states[item_name] = new_state
+        else:
+            self.clb.SetItemChecked(index, new_state)
+            item_name = self.clb.Items[index]
+            self.item_states[item_name] = new_state
+            
+        self.last_clicked_index = index
+
+    def get_selected_items(self):
+        return [name for name, is_checked in self.item_states.items() if is_checked]
+
 # Отображаем форму
 form = WorksetSelectorForm(workset_dict.keys())
 dialog_result = form.ShowDialog()
 
 selected_worksets = []
 if dialog_result == DialogResult.OK:
-    for item in form.clb.CheckedItems:
+    # Забираем выбранные элементы через новый метод
+    for item in form.get_selected_items():
         selected_worksets.append(workset_dict[item])
 
 created_views = []
@@ -100,23 +149,8 @@ if selected_worksets:
         new_view.ViewTemplateId = ElementId.InvalidElementId
 
         # --- НАСТРОЙКИ ГРАФИКИ ---
-        
-        # 1. Визуальный стиль
-        # DisplayStyle.Shading    = "Тонированный" (с тенями от освещения)
-        # DisplayStyle.FlatColors = "Заливка" (сплошные цвета, он же Consistent Colors)
-        # DisplayStyle.HLR        = "Скрытая линия"
-        # DisplayStyle.Wireframe  = "Каркас"
-        
-        new_view.DisplayStyle = DisplayStyle.FlatColors # Установлена "Заливка"
-        
-        # 2. Уровень детализации
-        # ViewDetailLevel.Coarse = "Низкий"
-        # ViewDetailLevel.Medium = "Средний"
-        # ViewDetailLevel.Fine   = "Высокий"
-        
+        new_view.DisplayStyle = DisplayStyle.FlatColors
         new_view.DetailLevel = ViewDetailLevel.Fine
-        
-        # 3. Масштаб (1:100)
         new_view.Scale = 100
         # -------------------------
 
