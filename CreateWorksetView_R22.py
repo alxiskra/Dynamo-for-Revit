@@ -1,4 +1,3 @@
-
 import clr
 clr.AddReference('RevitAPI')
 clr.AddReference('RevitServices')
@@ -8,7 +7,8 @@ clr.AddReference('System.Drawing')
 from Autodesk.Revit.DB import (
     FilteredElementCollector, FilteredWorksetCollector,
     WorksetKind, ViewFamilyType, ViewFamily, View3D,
-    WorksetVisibility, ElementId, Transaction
+    WorksetVisibility, ElementId, Transaction,
+    DisplayStyle, ViewDetailLevel
 )
 from RevitServices.Persistence import DocumentManager
 from RevitServices.Transactions import TransactionManager
@@ -70,35 +70,49 @@ if dialog_result == DialogResult.OK:
 created_views = []
 
 if selected_worksets:
-    # Получаем тип 3D вида
     view_types = FilteredElementCollector(doc).OfClass(ViewFamilyType).ToElements()
     view_3d_type = next((vt for vt in view_types if vt.ViewFamily == ViewFamily.ThreeDimensional), None)
 
-    # Собираем словарь существующих 3D видов {Имя вида: ElementId}
     existing_views = {v.Name: v.Id for v in FilteredElementCollector(doc).OfClass(View3D).ToElements()}
 
-    # Принудительно закрываем фоновую транзакцию Dynamo, чтобы использовать свою
     TransactionManager.Instance.ForceCloseTransaction()
 
-    # Запускаем свою транзакцию с заданным именем
     trans = Transaction(doc, "Dyn_Create workset view")
     trans.Start()
 
     for target_ws in selected_worksets:
-        view_name = "workset_" + target_ws.Name
+        view_name = "00_workset_" + target_ws.Name
 
         if view_name in existing_views:
-            # Вид уже существует: получаем его вместо удаления
             new_view = doc.GetElement(existing_views[view_name])
         else:
-            # Вида нет: создаем новый
             new_view = View3D.CreateIsometric(doc, view_3d_type.Id)
             new_view.Name = view_name
 
-        # Обновляем параметры вида (гарантированно отвязываем шаблон)
+        # Отвязываем шаблон
         new_view.ViewTemplateId = ElementId.InvalidElementId
 
-        # Заново изолируем целевой рабочий набор (на случай, если настройки сбились)
+        # --- НАСТРОЙКИ ГРАФИКИ ---
+        
+        # 1. Визуальный стиль
+        # DisplayStyle.Shading    = "Тонированный" (с тенями от освещения)
+        # DisplayStyle.FlatColors = "Заливка" (сплошные цвета, он же Consistent Colors)
+        # DisplayStyle.HLR        = "Скрытая линия"
+        # DisplayStyle.Wireframe  = "Каркас"
+        
+        new_view.DisplayStyle = DisplayStyle.FlatColors # Установлена "Заливка"
+        
+        # 2. Уровень детализации
+        # ViewDetailLevel.Coarse = "Низкий"
+        # ViewDetailLevel.Medium = "Средний"
+        # ViewDetailLevel.Fine   = "Высокий"
+        
+        new_view.DetailLevel = ViewDetailLevel.Fine
+        
+        # 3. Масштаб (1:100)
+        new_view.Scale = 100
+        # -------------------------
+
         for ws in worksets:
             if ws.Id == target_ws.Id:
                 new_view.SetWorksetVisibility(ws.Id, WorksetVisibility.Visible)
@@ -107,7 +121,6 @@ if selected_worksets:
 
         created_views.append(view_name)
 
-    # Завершаем нашу транзакцию
     trans.Commit()
 
 OUT = created_views if created_views else "Операция отменена или наборы не выбраны"
