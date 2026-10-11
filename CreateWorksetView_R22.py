@@ -21,7 +21,7 @@ from RevitServices.Persistence import DocumentManager
 from RevitServices.Transactions import TransactionManager
 from System.Windows.Forms import (
     Form, CheckedListBox, Button, DialogResult, FormBorderStyle, FormStartPosition,
-    TextBox, CheckState, Control, Keys
+    TextBox, CheckState, Control, Keys, Label
 )
 from System.Drawing import Size, Point
 
@@ -31,11 +31,11 @@ doc = DocumentManager.Instance.CurrentDBDocument
 worksets = list(FilteredWorksetCollector(doc).OfKind(WorksetKind.UserWorkset))
 workset_dict = {ws.Name: ws for ws in worksets}
 
-# Окно выбора рабочих наборов с поиском и поддержкой SHIFT
+# Окно выбора рабочих наборов с поиском, поддержкой SHIFT и видимыми кнопками
 class WorksetSelectorForm(Form):
     def __init__(self, names):
         self.Text = "Выбор рабочих наборов для 3D видов"
-        self.Size = Size(450, 550)
+        self.Size = Size(450, 620) # Увеличена высота окна
         self.StartPosition = FormStartPosition.CenterScreen
         self.FormBorderStyle = FormBorderStyle.FixedDialog
         self.MaximizeBox = False
@@ -45,30 +45,52 @@ class WorksetSelectorForm(Form):
         self.item_states = {name: False for name in self.all_names}
         self.last_clicked_index = -1
 
+        self.lbl = Label()
+        self.lbl.Text = "Поиск по имени. Shift+клик — отметить диапазон."
+        self.lbl.Location = Point(15, 10)
+        self.lbl.Size = Size(405, 20)
+        self.Controls.Add(self.lbl)
+
         self.tb_search = TextBox()
-        self.tb_search.Location = Point(15, 15)
+        self.tb_search.Location = Point(15, 35)
         self.tb_search.Size = Size(405, 20)
         self.tb_search.TextChanged += self.on_text_changed
         self.Controls.Add(self.tb_search)
 
         self.clb = CheckedListBox()
-        self.clb.Location = Point(15, 45)
-        self.clb.Size = Size(405, 400)
-        self.clb.CheckOnClick = False # Отключаем авто-чек, обрабатываем клики вручную
+        self.clb.Location = Point(15, 65)
+        self.clb.Size = Size(405, 435) # Скорректирован размер списка
+        self.clb.CheckOnClick = False 
         self.clb.MouseClick += self.on_mouse_click
         self.Controls.Add(self.clb)
 
+        # Кнопки быстрого выбора (слева внизу)
+        self.btn_all = Button()
+        self.btn_all.Text = "Выбрать все"
+        self.btn_all.Location = Point(15, 515)
+        self.btn_all.Size = Size(100, 30)
+        self.btn_all.Click += self.on_select_all
+        self.Controls.Add(self.btn_all)
+
+        self.btn_none = Button()
+        self.btn_none.Text = "Снять выбор"
+        self.btn_none.Location = Point(120, 515)
+        self.btn_none.Size = Size(100, 30)
+        self.btn_none.Click += self.on_select_none
+        self.Controls.Add(self.btn_none)
+
+        # Кнопки ОК / Отмена (справа внизу)
         self.btn_ok = Button()
         self.btn_ok.Text = "Создать виды"
-        self.btn_ok.Location = Point(200, 460)
-        self.btn_ok.Size = Size(120, 32)
+        self.btn_ok.Location = Point(225, 515)
+        self.btn_ok.Size = Size(95, 30)
         self.btn_ok.DialogResult = DialogResult.OK
         self.Controls.Add(self.btn_ok)
 
         self.btn_cancel = Button()
         self.btn_cancel.Text = "Отмена"
-        self.btn_cancel.Location = Point(330, 460)
-        self.btn_cancel.Size = Size(90, 32)
+        self.btn_cancel.Location = Point(325, 515)
+        self.btn_cancel.Size = Size(95, 30)
         self.btn_cancel.DialogResult = DialogResult.Cancel
         self.Controls.Add(self.btn_cancel)
 
@@ -87,6 +109,18 @@ class WorksetSelectorForm(Form):
 
     def on_text_changed(self, sender, event):
         self.update_list(sender.Text)
+
+    def on_select_all(self, sender, event):
+        for i in range(self.clb.Items.Count):
+            name = self.clb.Items[i]
+            self.clb.SetItemChecked(i, True)
+            self.item_states[name] = True
+
+    def on_select_none(self, sender, event):
+        for i in range(self.clb.Items.Count):
+            name = self.clb.Items[i]
+            self.clb.SetItemChecked(i, False)
+            self.item_states[name] = False
 
     def on_mouse_click(self, sender, event):
         index = self.clb.IndexFromPoint(event.Location)
@@ -119,7 +153,6 @@ dialog_result = form.ShowDialog()
 
 selected_worksets = []
 if dialog_result == DialogResult.OK:
-    # Забираем выбранные элементы через новый метод
     for item in form.get_selected_items():
         selected_worksets.append(workset_dict[item])
 
