@@ -133,7 +133,7 @@ if selected_worksets:
 
     TransactionManager.Instance.ForceCloseTransaction()
 
-    trans = Transaction(doc, "Dyn_Create workset view")
+    trans = Transaction(doc, "DYN_Create workset view")
     trans.Start()
 
     for target_ws in selected_worksets:
