@@ -8,7 +8,7 @@
 
 ---
 
-### 2. [Другой_Скрипт.py](https://github.com/alxiskra/Dynamo-for-Revit/blob/main/GetActiveSelection_R22.py)
+### 2. [GetActiveSelection_R22.py](https://github.com/alxiskra/Dynamo-for-Revit/blob/main/GetActiveSelection_R22.py)
 Передать в Dynamo выделенные Revit-элементы
 <details>
   <summary><b>▶ Play Demo</b></summary>
