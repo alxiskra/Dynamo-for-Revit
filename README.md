@@ -20,6 +20,17 @@
 
    ---
 
+1. **[CopyViewsFromLinkOrOpenModel_R22.py](https://github.com/alxiskra/Dynamo-for-Revit/blob/main/CopyViewsFromLinkOrOpenModel_R22.py)**
+   
+    Позволяет массово копировать Чертежные виды и Легенды из других открытых проектов или подгруженных связей (Revit Links) в активный документ. Включает удобный UI (Windows Forms) с фильтрацией, строкой поиска и функцией массового выбора через Shift. Автоматически игнорирует дубликаты.
+   <details>
+     <summary><b>▶Play Demo</b></summary>
+     <br>
+     <video src="https://github.com/user-attachments/assets/11127734-f38d-4f2b-8843-24c5aa7008eb" width="800" controls></video>
+   </details>
+   
+   ---
+
 1. **[GetActiveSelection_R22.py](https://github.com/alxiskra/Dynamo-for-Revit/blob/main/GetActiveSelection_R22.py)**
    
     Передача элементов, предварительно выделенных в интерфейсе Revit, напрямую в среду Dynamo. Нод позволяет гибко работать с пользовательским выбором: К примеру можно выделить нужные листы в диспетчере проекта и передать их дальнейшей цепочке нодов для пакетного экспорта в PDF.
@@ -28,3 +39,7 @@
      <br>
      <video src="https://github.com/user-attachments/assets/6827c8ba-50f3-4f9d-ae09-270375601ae3" width="800" controls></video>
    </details>
+
+
+
+
