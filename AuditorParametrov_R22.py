@@ -2,14 +2,14 @@
 # _______________________________________________________________________
 # Описание: Интерактивный аудит и НЕМОДАЛЬНЫЙ дашборд заполненности параметров
 #           элементов (Экземпляр и Тип) на 3D-виде, плане или в спецификации
-# Особенности версии v2.9 (Редактирование параметров по двойному клику в ведомости + Каталог + Профили JSON):
-#   - В стартовом окне справа добавлен полный каталог ВСЕХ доступных параметров
-#     выбранного вида и проекта (Экземпляр и Тип) с живым поиском и фильтрами
-#   - Клик мышью по параметру в правом списке сразу добавляет его в блок ввода
-#     слева (повторный клик убирает параметр); уже добавленные подсвечены зеленым
-#   - Поддержка пакетного добавления параметров через Shift/Ctrl
-#   - Автосохранение профилей (параметры + фильтр категорий) и экспорт/импорт JSON
-#   - Дашборд открывается в немодальном режиме (form.Show()) и НЕ блокирует Revit
+# Особенности версии v3.0:
+#   - Все окна (настройки, дашборд, карточка элемента) масштабируются и разворачиваются
+#     как стандартные окна Windows (FormBorderStyle.Sizable + AnchorStyles)
+#   - Универсальный профиль по умолчанию («Код по классификатору») для любых проектов
+#   - Галочка «Поверх окон» доступна в первом окне настроек и в дашборде
+#   - Режим «One-Click» в каталоге параметров справа для добавления/удаления в 1 клик
+#   - Окно редактирования параметров элемента по двойному клику с поддержкой прокрутки
+#     и изменения размера окна
 # Автор: Alexander Iskra (alxiskra)
 # Протестировано на Revit: v2022 (IronPython 2.7)
 # _______________________________________________________________________
@@ -43,11 +43,11 @@ from System.Collections.Generic import List
 from System.Windows.Forms import (
     Form, Button, DialogResult, FormBorderStyle, FormStartPosition,
     CheckBox, Label, ComboBox, ComboBoxStyle, RadioButton, TextBox,
-    Control, Keys, MouseButtons, Panel, TrackBar, TabControl, TabPage, DataGridView,
+    Control, Keys, MouseButtons, Panel, TabControl, TabPage, DataGridView,
     DataGridViewSelectionMode, DataGridViewAutoSizeColumnsMode,
     DataGridViewCheckBoxColumn, DataGridViewTextBoxColumn,
     ScrollBars, SaveFileDialog, OpenFileDialog, GroupBox,
-    ListBox, BorderStyle, FlatStyle
+    ListBox, BorderStyle, FlatStyle, AnchorStyles
 )
 from System.Drawing import (
     Size, Point, Font, FontStyle, Color, SolidBrush, Pen, Rectangle,
@@ -58,25 +58,31 @@ doc = DocumentManager.Instance.CurrentDBDocument
 uiapp = DocumentManager.Instance.CurrentUIApplication
 uidoc = uiapp.ActiveUIDocument
 
+# Константы привязки контролов при растягивании окон (AnchorStyles)
+ANCHOR_TOP_LEFT = AnchorStyles.Top | AnchorStyles.Left
+ANCHOR_TOP_RIGHT = AnchorStyles.Top | AnchorStyles.Right
+ANCHOR_TOP_LEFT_RIGHT = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right
+ANCHOR_TOP_BOTTOM_LEFT = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left
+ANCHOR_BOTTOM_LEFT = AnchorStyles.Bottom | AnchorStyles.Left
+ANCHOR_BOTTOM_RIGHT = AnchorStyles.Bottom | AnchorStyles.Right
+ANCHOR_BOTTOM_LEFT_RIGHT = AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right
+ANCHOR_ALL = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right
+
 
 # ==============================================================================
 # 0. МЕНЕДЖЕР КОНФИГУРАЦИЙ (АВТОСОХРАНЕНИЕ + ПРОФИЛИ + ЭКСПОРТ/ИМПОРТ JSON)
 # ==============================================================================
 
 DEFAULT_PARAMS_LIST = [
-    u"MR_Корпус",
-    u"MR_Комплект",
-    u"MR_Этаж",
-    u"MR_Код по классификатору"
+    u"Код по классификатору"
 ]
 
-EXTRA_PRESET_PARAMS = [
-    u"MR_Корпус",
-    u"MR_Комплект",
-    u"MR_Этаж",
-    u"MR_Код по классификатору",
-    u"Номер помещения",
-    u"Марка"
+FALLBACK_CATALOG_PARAMS = [
+    u"Код по классификатору",
+    u"Марка",
+    u"Комментарии",
+    u"Комментарии к типоразмеру",
+    u"Описание"
 ]
 
 
@@ -91,26 +97,21 @@ def get_default_config_file_path():
             os.makedirs(cfg_dir)
         except:
             pass
-    return os.path.join(cfg_dir, u"audit_configs_v24.json")
+    return os.path.join(cfg_dir, u"audit_configs_v30.json")
 
 
 def get_builtin_default_store():
-    """Базовая структура хранилища конфигураций по умолчанию."""
+    """Базовая структура хранилища конфигураций по умолчанию (только «Код по классификатору»)."""
     return {
-        u"active_profile": u"Стандарт MR (Базовый)",
+        u"active_profile": u"По умолчанию",
         u"last_session": {
             u"params": list(DEFAULT_PARAMS_LIST),
             u"input_mode": u"semicolon",
             u"category_states": {}
         },
         u"profiles": {
-            u"Стандарт MR (Базовый)": {
+            u"По умолчанию": {
                 u"params": list(DEFAULT_PARAMS_LIST),
-                u"input_mode": u"semicolon",
-                u"category_states": {}
-            },
-            u"Расширенный (+ Помещения и Марка)": {
-                u"params": list(EXTRA_PRESET_PARAMS),
                 u"input_mode": u"semicolon",
                 u"category_states": {}
             }
@@ -167,12 +168,12 @@ class AuditConfigManager(object):
             save_json_file(self.config_path, default_store)
             return default_store
 
-        if u"profiles" not in data or not isinstance(data[u"profiles"], dict):
+        if u"profiles" not in data or not isinstance(data[u"profiles"], dict) or not data[u"profiles"]:
             data[u"profiles"] = default_store[u"profiles"]
         if u"last_session" not in data or not isinstance(data[u"last_session"], dict):
             data[u"last_session"] = default_store[u"last_session"]
-        if u"active_profile" not in data:
-            data[u"active_profile"] = u"Стандарт MR (Базовый)"
+        if u"active_profile" not in data or data[u"active_profile"] not in data[u"profiles"]:
+            data[u"active_profile"] = sorted(data[u"profiles"].keys())[0]
         return data
 
     def save_store(self):
@@ -182,7 +183,7 @@ class AuditConfigManager(object):
         return sorted(self.store.get(u"profiles", {}).keys())
 
     def get_active_profile_name(self):
-        return self.store.get(u"active_profile", u"Стандарт MR (Базовый)")
+        return self.store.get(u"active_profile", u"По умолчанию")
 
     def get_last_session(self):
         return self.store.get(u"last_session", {
@@ -263,7 +264,7 @@ class AuditConfigManager(object):
 
     def export_single_config_to_file(self, filepath, profile_name, params_list, category_states_dict):
         export_obj = {
-            u"format": u"RevitParameterAuditorConfig_v2.9",
+            u"format": u"RevitParameterAuditorConfig_v3.0",
             u"profile_name": unicode(profile_name),
             u"params": list(params_list),
             u"category_states": dict(category_states_dict) if category_states_dict else {}
@@ -301,7 +302,7 @@ class AuditConfigManager(object):
 
 
 # ==============================================================================
-# 1. ОБРАБОТЧИК EXTERNAL EVENT ДЛЯ НЕМОДАЛЬНОГО ОКНА (ИЗОЛЯЦИЯ / ЗУМ В REVIT)
+# 1. ОБРАБОТЧИК EXTERNAL EVENT ДЛЯ НЕМОДАЛЬНОГО ОКНА (ИЗОЛЯЦИЯ / ЗУМ / ЗАПИСЬ)
 # ==============================================================================
 
 class RevitModelessActionHandler(IExternalEventHandler):
@@ -309,7 +310,7 @@ class RevitModelessActionHandler(IExternalEventHandler):
         self.action_type = None
         self.element_ids = None
         self.target_element_id_int = None
-        self.params_to_set = None  # dict: {param_name: new_value_str}
+        self.params_to_set = None
         self.on_params_written_callback = None
         self.status_callback = None
 
@@ -646,18 +647,8 @@ def resolve_parameter_value(doc_ref, elem, param_name):
     return (False, u"<Пусто>", scope_str)
 
 
-
 def inspect_editable_parameter(doc_ref, elem, param_name):
-    """
-    Возвращает подробную информацию о параметре для окна редактирования:
-      {
-        'exists': bool,
-        'is_readonly': bool,
-        'scope': u'Экземпляр' | u'Тип' | u'Отсутствует',
-        'storage_type': StorageType | None,
-        'current_val': unicode
-      }
-    """
+    """Возвращает подробную информацию о параметре для окна редактирования."""
     param = elem.LookupParameter(param_name)
     scope_str = u"Экземпляр"
 
@@ -681,7 +672,6 @@ def inspect_editable_parameter(doc_ref, elem, param_name):
 
     is_ro = bool(param.IsReadOnly)
     st = param.StorageType
-    # Для StorageType.ElementId редактирование текстом обычно недоступно (кроме просмотра)
     if st == StorageType.ElementId:
         is_ro = True
 
@@ -698,10 +688,7 @@ def inspect_editable_parameter(doc_ref, elem, param_name):
 
 
 def write_single_parameter_value(doc_ref, elem, param_name, new_value_str):
-    """
-    Записывает новое значение в параметр Экземпляра или Типа (внутри открытой транзакции).
-    Возвращает (success_bool, message_str, is_type_param_bool).
-    """
+    """Записывает новое значение в параметр Экземпляра или Типа (внутри открытой транзакции)."""
     param = elem.LookupParameter(param_name)
     is_type_param = False
 
@@ -770,11 +757,8 @@ def collect_elements_from_view(doc_ref, view_elem):
 def discover_available_parameters(doc_ref, view_elem=None, only_view_elements=True):
     """
     Быстро собирает все доступные параметры (Экземпляр и Тип) для правого каталога:
-    1) Из ParameterBindings документа (все параметры проекта и общие параметры MR_*, ADSK_* и т.д.)
-    2) Путем быстрого сэмплирования типоразмеров и категорий элементов на выбранном виде,
-       чтобы получить все системные и семейственные параметры (Марка, Номер помещения, Уровень и др.)
-       без перебора десятков тысяч однотипных элементов.
-    Возвращает словарь: param_name -> set(['Экземпляр', 'Тип'])
+    1) Из ParameterBindings документа (все параметры проекта и общие параметры)
+    2) Путем сэмплирования типоразмеров и категорий элементов на выбранном виде.
     """
     params_map = {}
 
@@ -929,7 +913,7 @@ def build_all_revit_categories_catalog(doc_ref, view_elements, saved_category_st
 
 
 # ==============================================================================
-# 3. ДВУХКОЛОНОЧНОЕ ОКНО НАСТРОЙКИ (СЛЕВА — ВИД И ВВОД, СПРАВА — ВСЕ ПАРАМЕТРЫ)
+# 3. ДВУХКОЛОНОЧНОЕ ОКНО НАСТРОЙКИ (МАСШТАБИРУЕМОЕ + ГАЛОЧКА «ПОВЕРХ ОКОН»)
 # ==============================================================================
 
 class ParameterAuditConfigForm(Form):
@@ -937,12 +921,13 @@ class ParameterAuditConfigForm(Form):
         self.doc = doc_ref
         self.cfg_mgr = cfg_mgr
         self.current_view_override = current_view_override
-        self.Text = u"BIM Аудит параметров модели v2.9 (Revit 2022)"
+        self.Text = u"BIM Аудит параметров модели v3.0 (Revit 2022)"
         self.Size = Size(960, 780)
+        self.MinimumSize = Size(880, 640)
         self.StartPosition = FormStartPosition.CenterScreen
-        self.FormBorderStyle = FormBorderStyle.FixedDialog
-        self.MaximizeBox = False
-        self.MinimizeBox = False
+        self.FormBorderStyle = FormBorderStyle.Sizable
+        self.MaximizeBox = True
+        self.MinimizeBox = True
         self.TopMost = True
         self.BackColor = Color.FromArgb(245, 247, 250)
         self.Shown += self.on_form_shown
@@ -952,7 +937,6 @@ class ParameterAuditConfigForm(Form):
         self.selected_category_states = {}
         self.available_views_dict = {}
         self.discovered_params_map = {}
-        self.dynamic_textboxes = []
         self._suppress_profile_change = False
         self._suppress_text_sync = False
 
@@ -965,20 +949,34 @@ class ParameterAuditConfigForm(Form):
             initial_params = list(DEFAULT_PARAMS_LIST)
         self.selected_category_states = dict(last_sess.get(u"category_states", {}))
 
-        # --- ШАПКА ---
-        pnl_header = Panel(Location=Point(0, 0), Size=Size(960, 52), BackColor=Color.FromArgb(30, 41, 59))
+        # --- ШАПКА С ГАЛОЧКОЙ «ПОВЕРХ ОКОН» ---
+        pnl_header = Panel(
+            Location=Point(0, 0), Size=Size(944, 52),
+            BackColor=Color.FromArgb(30, 41, 59),
+            Anchor=ANCHOR_TOP_LEFT_RIGHT
+        )
         lbl_title = Label(
-            Text=u"Проверка заполненности обязательных параметров (v2.9)",
-            Location=Point(15, 8), Size=Size(900, 22),
+            Text=u"Проверка заполненности обязательных параметров (v3.0)",
+            Location=Point(15, 8), Size=Size(750, 22),
             ForeColor=Color.White, Font=Font("Segoe UI", 11, FontStyle.Bold)
         )
         lbl_sub = Label(
-            Text=u"Слева: выбор вида и список проверяемых параметров  |  Справа: живой каталог всех доступных параметров модели (клик = добавить/убрать)",
-            Location=Point(15, 30), Size=Size(920, 18),
+            Text=u"Слева: выбор вида и список проверяемых параметров  |  Справа: каталог всех доступных параметров модели",
+            Location=Point(15, 30), Size=Size(780, 18),
             ForeColor=Color.FromArgb(148, 163, 184), Font=Font("Segoe UI", 8.5, FontStyle.Regular)
         )
+        self.chk_topmost = CheckBox(
+            Text=u"Поверх окон",
+            Location=Point(815, 15), Size=Size(115, 22),
+            Checked=True,
+            ForeColor=Color.White,
+            Font=Font("Segoe UI", 8.5, FontStyle.Bold),
+            Anchor=ANCHOR_TOP_RIGHT
+        )
+        self.chk_topmost.CheckedChanged += self.on_toggle_topmost
         pnl_header.Controls.Add(lbl_title)
         pnl_header.Controls.Add(lbl_sub)
+        pnl_header.Controls.Add(self.chk_topmost)
         self.Controls.Add(pnl_header)
 
         # ======================================================================
@@ -989,7 +987,8 @@ class ParameterAuditConfigForm(Form):
         grp_cfg = GroupBox(
             Text=u"Профиль настроек (Параметры + Фильтр категорий)",
             Location=Point(15, 58), Size=Size(485, 86),
-            Font=Font("Segoe UI", 9, FontStyle.Bold)
+            Font=Font("Segoe UI", 9, FontStyle.Bold),
+            Anchor=ANCHOR_TOP_LEFT
         )
 
         self.cb_profiles = ComboBox(
@@ -1048,7 +1047,8 @@ class ParameterAuditConfigForm(Form):
         grp_view = GroupBox(
             Text=u"1. Источник элементов (3D-вид, План или Спецификация)",
             Location=Point(15, 150), Size=Size(485, 235),
-            Font=Font("Segoe UI", 9, FontStyle.Bold)
+            Font=Font("Segoe UI", 9, FontStyle.Bold),
+            Anchor=ANCHOR_TOP_LEFT
         )
 
         self.chk_3d = CheckBox(
@@ -1104,14 +1104,16 @@ class ParameterAuditConfigForm(Form):
         grp_params = GroupBox(
             Text=u"2. Выбранные параметры для анализа (через разделитель «;»)",
             Location=Point(15, 392), Size=Size(485, 285),
-            Font=Font("Segoe UI", 9, FontStyle.Bold)
+            Font=Font("Segoe UI", 9, FontStyle.Bold),
+            Anchor=ANCHOR_TOP_BOTTOM_LEFT
         )
 
         lbl_semi_hint = Label(
             Text=u"Кликайте по параметрам в каталоге СПРАВА (для добавления/удаления)\nили редактируйте список параметров через точку с запятой (;) вручную:",
             Location=Point(12, 24), Size=Size(460, 34),
             Font=Font("Segoe UI", 8.5, FontStyle.Regular),
-            ForeColor=Color.FromArgb(51, 65, 85)
+            ForeColor=Color.FromArgb(51, 65, 85),
+            Anchor=ANCHOR_TOP_LEFT
         )
         grp_params.Controls.Add(lbl_semi_hint)
 
@@ -1119,7 +1121,8 @@ class ParameterAuditConfigForm(Form):
             Location=Point(12, 62), Size=Size(460, 170),
             Multiline=True, ScrollBars=ScrollBars.Vertical,
             Font=Font("Segoe UI", 9.5, FontStyle.Regular),
-            Text=u";".join(initial_params)
+            Text=u";".join(initial_params),
+            Anchor=ANCHOR_ALL
         )
         self.tb_semicolon.TextChanged += self.on_semicolon_text_changed
         grp_params.Controls.Add(self.tb_semicolon)
@@ -1127,7 +1130,8 @@ class ParameterAuditConfigForm(Form):
         btn_clear_all = Button(
             Text=u"Очистить поле",
             Location=Point(12, 240), Size=Size(135, 30),
-            Font=Font("Segoe UI", 8.5, FontStyle.Regular), BackColor=Color.White
+            Font=Font("Segoe UI", 8.5, FontStyle.Regular), BackColor=Color.White,
+            Anchor=ANCHOR_BOTTOM_LEFT
         )
         btn_clear_all.Click += self.on_clear_params_click
         grp_params.Controls.Add(btn_clear_all)
@@ -1137,7 +1141,8 @@ class ParameterAuditConfigForm(Form):
             Location=Point(250, 246), Size=Size(222, 20),
             Font=Font("Segoe UI", 8.5, FontStyle.Bold),
             ForeColor=Color.FromArgb(30, 64, 175),
-            TextAlign=ContentAlignment.MiddleRight
+            TextAlign=ContentAlignment.MiddleRight,
+            Anchor=ANCHOR_BOTTOM_RIGHT
         )
         grp_params.Controls.Add(self.lbl_selected_cnt)
 
@@ -1145,25 +1150,27 @@ class ParameterAuditConfigForm(Form):
 
         # ======================================================================
         # ПРАВАЯ КОЛОНКА: КАТАЛОГ ВСЕХ ДОСТУПНЫХ ПАРАМЕТРОВ МОДЕЛИ / ВИДА
-        # (X = 512, Ширина = 420)
         # ======================================================================
 
         grp_catalog = GroupBox(
             Text=u"3. Все доступные параметры (Клик по строке = добавить / убрать)",
             Location=Point(512, 58), Size=Size(420, 619),
-            Font=Font("Segoe UI", 9, FontStyle.Bold)
+            Font=Font("Segoe UI", 9, FontStyle.Bold),
+            Anchor=ANCHOR_ALL
         )
 
         lbl_cat_search = Label(
-            Text=u"Живой поиск параметра (например: MR_, Марка, Код, Этаж):",
+            Text=u"Живой поиск параметра (например: Марка, Код, Комментарии, Этаж):",
             Location=Point(12, 22), Size=Size(395, 18),
-            Font=Font("Segoe UI", 8.5, FontStyle.Regular)
+            Font=Font("Segoe UI", 8.5, FontStyle.Regular),
+            Anchor=ANCHOR_TOP_LEFT_RIGHT
         )
         grp_catalog.Controls.Add(lbl_cat_search)
 
         self.tb_catalog_search = TextBox(
             Location=Point(12, 42), Size=Size(310, 23),
-            Font=Font("Segoe UI", 9, FontStyle.Regular)
+            Font=Font("Segoe UI", 9, FontStyle.Regular),
+            Anchor=ANCHOR_TOP_LEFT_RIGHT
         )
         self.tb_catalog_search.TextChanged += self.refresh_catalog_grid
         grp_catalog.Controls.Add(self.tb_catalog_search)
@@ -1171,34 +1178,41 @@ class ParameterAuditConfigForm(Form):
         btn_clear_cat_search = Button(
             Text=u"Сброс",
             Location=Point(328, 41), Size=Size(80, 25),
-            Font=Font("Segoe UI", 8, FontStyle.Regular), BackColor=Color.White
+            Font=Font("Segoe UI", 8, FontStyle.Regular), BackColor=Color.White,
+            Anchor=ANCHOR_TOP_RIGHT
         )
         btn_clear_cat_search.Click += self.on_clear_catalog_search
         grp_catalog.Controls.Add(btn_clear_cat_search)
 
         self.chk_cat_inst = CheckBox(
             Text=u"Экземпляр", Location=Point(12, 71), Size=Size(95, 20),
-            Checked=True, Font=Font("Segoe UI", 8.2, FontStyle.Regular)
+            Checked=True, Font=Font("Segoe UI", 8.2, FontStyle.Regular),
+            Anchor=ANCHOR_TOP_LEFT
         )
         self.chk_cat_inst.CheckedChanged += self.refresh_catalog_grid
         grp_catalog.Controls.Add(self.chk_cat_inst)
 
         self.chk_cat_type = CheckBox(
             Text=u"Тип", Location=Point(112, 71), Size=Size(60, 20),
-            Checked=True, Font=Font("Segoe UI", 8.2, FontStyle.Regular)
+            Checked=True, Font=Font("Segoe UI", 8.2, FontStyle.Regular),
+            Anchor=ANCHOR_TOP_LEFT
         )
         self.chk_cat_type.CheckedChanged += self.refresh_catalog_grid
         grp_catalog.Controls.Add(self.chk_cat_type)
 
         self.chk_click_to_toggle = CheckBox(
-            Text=u"Одиночный клик сразу добавляет/убирает",
-            Location=Point(175, 71), Size=Size(238, 20),
-            Checked=True, Font=Font("Segoe UI", 8, FontStyle.Bold),
-            ForeColor=Color.FromArgb(22, 101, 52)
+            Text=u"One-Click",
+            Location=Point(180, 71), Size=Size(120, 20),
+            Checked=True, Font=Font("Segoe UI", 8.5, FontStyle.Bold),
+            ForeColor=Color.FromArgb(22, 101, 52),
+            Anchor=ANCHOR_TOP_LEFT
         )
         grp_catalog.Controls.Add(self.chk_click_to_toggle)
 
-        self.dgv_catalog = DataGridView(Location=Point(12, 96), Size=Size(396, 472))
+        self.dgv_catalog = DataGridView(
+            Location=Point(12, 96), Size=Size(396, 472),
+            Anchor=ANCHOR_ALL
+        )
         self.dgv_catalog.AllowUserToAddRows = False
         self.dgv_catalog.AllowUserToDeleteRows = False
         self.dgv_catalog.ReadOnly = True
@@ -1236,7 +1250,8 @@ class ParameterAuditConfigForm(Form):
             Location=Point(12, 576), Size=Size(235, 32),
             Font=Font("Segoe UI", 8.2, FontStyle.Bold),
             BackColor=Color.FromArgb(239, 246, 255), ForeColor=Color.FromArgb(30, 64, 175),
-            FlatStyle=FlatStyle.Flat
+            FlatStyle=FlatStyle.Flat,
+            Anchor=ANCHOR_BOTTOM_LEFT
         )
         btn_add_sel_cat.Click += self.on_add_selected_from_catalog
         grp_catalog.Controls.Add(btn_add_sel_cat)
@@ -1246,7 +1261,8 @@ class ParameterAuditConfigForm(Form):
             Location=Point(252, 583), Size=Size(155, 20),
             Font=Font("Segoe UI", 8, FontStyle.Regular),
             ForeColor=Color.FromArgb(100, 116, 139),
-            TextAlign=ContentAlignment.MiddleRight
+            TextAlign=ContentAlignment.MiddleRight,
+            Anchor=ANCHOR_BOTTOM_RIGHT
         )
         grp_catalog.Controls.Add(self.lbl_catalog_total)
 
@@ -1260,7 +1276,8 @@ class ParameterAuditConfigForm(Form):
             Location=Point(565, 690), Size=Size(260, 42),
             Font=Font("Segoe UI", 9.5, FontStyle.Bold),
             BackColor=Color.FromArgb(37, 99, 235), ForeColor=Color.White,
-            FlatStyle=FlatStyle.Flat
+            FlatStyle=FlatStyle.Flat,
+            Anchor=ANCHOR_BOTTOM_RIGHT
         )
         self.btn_run.Click += self.on_run_click
         self.Controls.Add(self.btn_run)
@@ -1269,7 +1286,8 @@ class ParameterAuditConfigForm(Form):
             Text=u"Отмена",
             Location=Point(835, 690), Size=Size(97, 42),
             Font=Font("Segoe UI", 9, FontStyle.Regular),
-            BackColor=Color.White, DialogResult=DialogResult.Cancel
+            BackColor=Color.White, DialogResult=DialogResult.Cancel,
+            Anchor=ANCHOR_BOTTOM_RIGHT
         )
         self.Controls.Add(self.btn_cancel)
 
@@ -1280,6 +1298,9 @@ class ParameterAuditConfigForm(Form):
         self.refresh_views_list()
         self.select_initial_active_view()
         self.reload_discovered_parameters_for_current_view()
+
+    def on_toggle_topmost(self, sender, event):
+        self.TopMost = self.chk_topmost.Checked
 
     # ==========================================================================
     # МЕТОДЫ КАТАЛОГА ВСЕХ ПАРАМЕТРОВ СПРАВА
@@ -1293,7 +1314,7 @@ class ParameterAuditConfigForm(Form):
     def reload_discovered_parameters_for_current_view(self):
         v_obj = self.get_currently_highlighted_view_obj()
         self.discovered_params_map = discover_available_parameters(self.doc, v_obj, only_view_elements=False)
-        for p in EXTRA_PRESET_PARAMS:
+        for p in FALLBACK_CATALOG_PARAMS:
             if p not in self.discovered_params_map:
                 self.discovered_params_map[p] = set([u"Экземпляр/Тип"])
         self.refresh_catalog_grid()
@@ -1521,7 +1542,7 @@ class ParameterAuditConfigForm(Form):
                 self.lbl_cfg_status.Text = u"✓ Выгружен JSON"
 
     # ==========================================================================
-    # МЕТОДЫ ВЫБОРА ВИДОВ И ПОЛЕЙ ПАРАМЕТРОВ
+    # МЕТОДЫ ВЫБОРА ВИДОВ
     # ==========================================================================
 
     def get_view_prefix(self, v):
@@ -1584,7 +1605,7 @@ class ParameterAuditConfigForm(Form):
 
     def on_form_shown(self, sender, event):
         try:
-            self.TopMost = True
+            self.TopMost = self.chk_topmost.Checked
             self.BringToFront()
             self.Activate()
         except:
@@ -1614,8 +1635,6 @@ class ParameterAuditConfigForm(Form):
             self.refresh_views_list()
         except:
             pass
-
-
 
     def on_run_click(self, sender, event):
         chosen_view = None
@@ -1780,63 +1799,79 @@ def aggregate_audit_from_records(raw_records, param_names, enabled_categories_se
 
 
 # ==============================================================================
-
-# ==============================================================================
-# 4.5. ОКНО РЕДАКТИРОВАНИЯ ПАРАМЕТРОВ ЭЛЕМЕНТА ПО ДВОЙНОМУ КЛИКУ (v2.8)
+# 4.5. МАСШТАБИРУЕМОЕ ОКНО РЕДАКТИРОВАНИЯ ПАРАМЕТРОВ ЭЛЕМЕНТА С ПРОКРУТКОЙ (v3.0)
 # ==============================================================================
 
 class ElementParameterEditorForm(Form):
     """
     Открывается при двойном клике по строке на вкладке «3. Поэлементный список».
-    Показывает сверху вниз все анализируемые параметры, их принадлежность (Экземпляр/Тип)
-    и текущие значения с возможностью вписать новые значения или выбрать из существующих.
+    Поддерживает свободное изменение размеров окна (Sizable) и вертикальную прокрутку
+    при любом количестве параметров.
     """
     def __init__(self, doc_ref, elem, param_names, param_stats):
         self.doc = doc_ref
         self.elem = elem
         self.param_names = param_names
         self.param_stats = param_stats
-        self.updated_values = {}  # param_name -> new_str_value
-        self.input_controls = {}  # param_name -> (ComboBox, initial_val_str)
+        self.updated_values = {}
+        self.input_controls = {}
 
         el_id_int = elem.Id.IntegerValue
         cat_name = elem.Category.Name if elem.Category else u"<Без категории>"
         fam_type = get_element_type_name(doc_ref, elem)
 
         self.Text = u"Редактирование параметров элемента — ID {}".format(el_id_int)
-        form_h = min(680, max(340, 175 + len(param_names) * 68))
-        self.Size = Size(560, form_h)
+        form_h = min(680, max(360, 185 + len(param_names) * 68))
+        self.Size = Size(580, form_h)
+        self.MinimumSize = Size(480, 320)
         self.StartPosition = FormStartPosition.CenterParent
-        self.FormBorderStyle = FormBorderStyle.FixedDialog
-        self.MaximizeBox = False
+        self.FormBorderStyle = FormBorderStyle.Sizable
+        self.MaximizeBox = True
         self.MinimizeBox = False
         self.TopMost = True
         self.BackColor = Color.FromArgb(245, 247, 250)
         self.Shown += self.on_shown
 
         # --- ШАПКА КАРТОЧКИ ЭЛЕМЕНТА ---
-        pnl_hdr = Panel(Location=Point(0, 0), Size=Size(560, 62), BackColor=Color.FromArgb(30, 41, 59))
+        pnl_hdr = Panel(
+            Location=Point(0, 0), Size=Size(564, 62),
+            BackColor=Color.FromArgb(30, 41, 59),
+            Anchor=ANCHOR_TOP_LEFT_RIGHT
+        )
         lbl_el_title = Label(
             Text=u"Элемент ID: {}  |  {}".format(el_id_int, cat_name),
-            Location=Point(14, 8), Size=Size(520, 22),
-            ForeColor=Color.White, Font=Font("Segoe UI", 10.5, FontStyle.Bold)
+            Location=Point(14, 8), Size=Size(410, 22),
+            ForeColor=Color.White, Font=Font("Segoe UI", 10.5, FontStyle.Bold),
+            Anchor=ANCHOR_TOP_LEFT_RIGHT
         )
         lbl_el_sub = Label(
             Text=u"Семейство и Тип: {}".format(fam_type),
-            Location=Point(14, 32), Size=Size(520, 20),
+            Location=Point(14, 32), Size=Size(530, 20),
             ForeColor=Color.FromArgb(148, 163, 184), Font=Font("Segoe UI", 8.5, FontStyle.Regular),
-            AutoEllipsis=True
+            AutoEllipsis=True,
+            Anchor=ANCHOR_TOP_LEFT_RIGHT
         )
+        self.chk_topmost = CheckBox(
+            Text=u"Поверх окон",
+            Location=Point(440, 8), Size=Size(112, 22),
+            Checked=True,
+            ForeColor=Color.White,
+            Font=Font("Segoe UI", 8, FontStyle.Bold),
+            Anchor=ANCHOR_TOP_RIGHT
+        )
+        self.chk_topmost.CheckedChanged += self.on_toggle_topmost
         pnl_hdr.Controls.Add(lbl_el_title)
         pnl_hdr.Controls.Add(lbl_el_sub)
+        pnl_hdr.Controls.Add(self.chk_topmost)
         self.Controls.Add(pnl_hdr)
 
         # --- ПРОКРУЧИВАЕМЫЙ СПИСОК ПАРАМЕТРОВ СВЕРХУ ВНИЗ ---
         scroll_h = form_h - 165
         self.pnl_list = Panel(
-            Location=Point(12, 70), Size=Size(520, scroll_h),
+            Location=Point(12, 70), Size=Size(540, scroll_h),
             AutoScroll=True, BackColor=Color.White,
-            BorderStyle=BorderStyle.FixedSingle
+            BorderStyle=BorderStyle.FixedSingle,
+            Anchor=ANCHOR_ALL
         )
 
         y = 10
@@ -1852,15 +1887,17 @@ class ElementParameterEditorForm(Form):
             cur_val = meta['current_val']
 
             row_pnl = Panel(
-                Location=Point(8, y), Size=Size(482, 58),
+                Location=Point(8, y), Size=Size(500, 58),
                 BackColor=Color.FromArgb(248, 250, 252) if exists else Color.FromArgb(254, 242, 242),
-                BorderStyle=BorderStyle.FixedSingle
+                BorderStyle=BorderStyle.FixedSingle,
+                Anchor=ANCHOR_TOP_LEFT_RIGHT
             )
 
             lbl_p = Label(
                 Text=u"{}. {}".format(idx + 1, p_name),
-                Location=Point(10, 6), Size=Size(260, 20),
-                Font=f_pname, ForeColor=Color.FromArgb(15, 23, 42)
+                Location=Point(10, 6), Size=Size(270, 20),
+                Font=f_pname, ForeColor=Color.FromArgb(15, 23, 42),
+                Anchor=ANCHOR_TOP_LEFT_RIGHT
             )
             row_pnl.Controls.Add(lbl_p)
 
@@ -1879,16 +1916,17 @@ class ElementParameterEditorForm(Form):
 
             lbl_sc = Label(
                 Text=scope_text,
-                Location=Point(272, 6), Size=Size(200, 20),
+                Location=Point(285, 6), Size=Size(202, 20),
                 Font=f_scope, ForeColor=scope_col,
-                TextAlign=ContentAlignment.MiddleRight
+                TextAlign=ContentAlignment.MiddleRight,
+                Anchor=ANCHOR_TOP_RIGHT
             )
             row_pnl.Controls.Add(lbl_sc)
 
-            # Поле ввода (ComboBox со свободным вводом текста + подсказки уже существующих значений модели)
             cb_val = ComboBox(
-                Location=Point(10, 28), Size=Size(460, 24),
-                Font=f_input, DropDownStyle=ComboBoxStyle.DropDown
+                Location=Point(10, 28), Size=Size(478, 24),
+                Font=f_input, DropDownStyle=ComboBoxStyle.DropDown,
+                Anchor=ANCHOR_TOP_LEFT_RIGHT
             )
             if p_name in self.param_stats:
                 val_counts = self.param_stats[p_name].get('value_counts', {})
@@ -1905,36 +1943,44 @@ class ElementParameterEditorForm(Form):
             self.pnl_list.Controls.Add(row_pnl)
             y += 64
 
+        # Задаем минимальный размер области прокрутки, чтобы скроллбар гарантированно работал при любом числе полей
+        self.pnl_list.AutoScrollMinSize = Size(440, y + 10)
         self.Controls.Add(self.pnl_list)
 
         # --- КНОПКИ ОК / ОТМЕНА ---
         btn_y = form_h - 84
         self.btn_ok = Button(
             Text=u"ОК (Записать в модель)",
-            Location=Point(232, btn_y), Size=Size(195, 36),
+            Location=Point(252, btn_y), Size=Size(195, 36),
             Font=Font("Segoe UI", 9, FontStyle.Bold),
             BackColor=Color.FromArgb(22, 101, 52), ForeColor=Color.White,
-            FlatStyle=FlatStyle.Flat
+            FlatStyle=FlatStyle.Flat,
+            Anchor=ANCHOR_BOTTOM_RIGHT
         )
         self.btn_ok.Click += self.on_ok_click
         self.Controls.Add(self.btn_ok)
 
         self.btn_cancel = Button(
             Text=u"Отмена",
-            Location=Point(437, btn_y), Size=Size(95, 36),
+            Location=Point(457, btn_y), Size=Size(95, 36),
             Font=Font("Segoe UI", 9, FontStyle.Regular),
-            BackColor=Color.White, DialogResult=DialogResult.Cancel
+            BackColor=Color.White, DialogResult=DialogResult.Cancel,
+            Anchor=ANCHOR_BOTTOM_RIGHT
         )
         self.Controls.Add(self.btn_cancel)
 
         self.AcceptButton = self.btn_ok
         self.CancelButton = self.btn_cancel
 
+    def on_toggle_topmost(self, sender, event):
+        self.TopMost = self.chk_topmost.Checked
+
     def on_shown(self, sender, event):
         try:
-            self.TopMost = True
+            self.TopMost = self.chk_topmost.Checked
             self.BringToFront()
             self.Activate()
+            self.pnl_list.Focus()
         except:
             pass
 
@@ -1949,7 +1995,8 @@ class ElementParameterEditorForm(Form):
         self.Close()
 
 
-# 5. НЕМОДАЛЬНЫЙ ГРАФИЧЕСКИЙ ДАШБОРД (v2.5)
+# ==============================================================================
+# 5. НЕМОДАЛЬНЫЙ МАСШТАБИРУЕМЫЙ ГРАФИЧЕСКИЙ ДАШБОРД (v3.0)
 # ==============================================================================
 
 class AuditDashboardForm(Form):
@@ -1978,24 +2025,30 @@ class AuditDashboardForm(Form):
         except:
             self.ext_event = None
 
-        self.Text = u"Дашборд BIM-аудита v2.9 (Немодальный режим — окно Revit активно) — Вид: {}".format(self.view_name)
+        self.Text = u"Дашборд BIM-аудита v3.0 (Немодальный режим — окно Revit активно) — Вид: {}".format(self.view_name)
         self.Size = Size(1020, 755)
+        self.MinimumSize = Size(960, 620)
         self.StartPosition = FormStartPosition.CenterScreen
-        self.FormBorderStyle = FormBorderStyle.FixedSingle
-        self.MaximizeBox = False
+        self.FormBorderStyle = FormBorderStyle.Sizable
+        self.MaximizeBox = True
         self.MinimizeBox = True
         self.TopMost = True
         self.BackColor = Color.FromArgb(241, 245, 249)
 
         # --- ВЕРХНЯЯ ПАНЕЛЬ KPI + ОБЩИЙ ПРОГРЕСС-БАР ---
-        self.pnl_top = Panel(Location=Point(12, 10), Size=Size(980, 115), BackColor=Color.White)
+        self.pnl_top = Panel(
+            Location=Point(12, 10), Size=Size(980, 115),
+            BackColor=Color.White,
+            Anchor=ANCHOR_TOP_LEFT_RIGHT
+        )
         self.pnl_top.Paint += self.on_paint_top_kpi
 
         self.chk_topmost = CheckBox(
-            Text=u"Поверх Revit",
+            Text=u"Поверх окон",
             Location=Point(595, 8), Size=Size(105, 22),
             Checked=True, Font=Font("Segoe UI", 8.5, FontStyle.Bold),
-            ForeColor=Color.FromArgb(30, 58, 138)
+            ForeColor=Color.FromArgb(30, 58, 138),
+            Anchor=ANCHOR_TOP_RIGHT
         )
         self.chk_topmost.CheckedChanged += self.on_toggle_topmost
         self.pnl_top.Controls.Add(self.chk_topmost)
@@ -2004,7 +2057,8 @@ class AuditDashboardForm(Form):
             Text=u"⚙ Параметры / Вид",
             Location=Point(705, 5), Size=Size(130, 26),
             Font=Font("Segoe UI", 8, FontStyle.Bold),
-            BackColor=Color.White, ForeColor=Color.FromArgb(51, 65, 85)
+            BackColor=Color.White, ForeColor=Color.FromArgb(51, 65, 85),
+            Anchor=ANCHOR_TOP_RIGHT
         )
         self.btn_change_params.Click += self.on_reopen_config_dialog
         self.pnl_top.Controls.Add(self.btn_change_params)
@@ -2014,7 +2068,8 @@ class AuditDashboardForm(Form):
             Location=Point(842, 5), Size=Size(128, 26),
             Font=Font("Segoe UI", 8.5, FontStyle.Bold),
             BackColor=Color.FromArgb(239, 246, 255), ForeColor=Color.FromArgb(29, 78, 216),
-            FlatStyle=FlatStyle.Flat
+            FlatStyle=FlatStyle.Flat,
+            Anchor=ANCHOR_TOP_RIGHT
         )
         self.btn_refresh.Click += self.on_refresh_audit_from_revit
         self.pnl_top.Controls.Add(self.btn_refresh)
@@ -2022,14 +2077,19 @@ class AuditDashboardForm(Form):
         self.Controls.Add(self.pnl_top)
 
         # --- ВКЛАДКИ ДАШБОРДА ---
-        self.tabs = TabControl(Location=Point(12, 132), Size=Size(980, 490), Font=Font("Segoe UI", 9, FontStyle.Regular))
+        self.tabs = TabControl(
+            Location=Point(12, 132), Size=Size(980, 490),
+            Font=Font("Segoe UI", 9, FontStyle.Regular),
+            Anchor=ANCHOR_ALL
+        )
 
         # Вкладка 1: Карточки параметров
         self.tab_visual = TabPage(Text=u"1. Графический дашборд по параметрам")
         self.tab_visual.BackColor = Color.White
         self.pnl_bars = Panel(
             Location=Point(8, 8), Size=Size(956, 444),
-            AutoScroll=True, BackColor=Color.White
+            AutoScroll=True, BackColor=Color.White,
+            Anchor=ANCHOR_ALL
         )
         self.tab_visual.Controls.Add(self.pnl_bars)
         self.tabs.TabPages.Add(self.tab_visual)
@@ -2038,6 +2098,7 @@ class AuditDashboardForm(Form):
         self.tab_cats = TabPage(Text=u"2. Сводка по категориям")
         self.tab_cats.BackColor = Color.White
         self.dgv_cats = self.create_styled_grid(Point(10, 10), Size(952, 440))
+        self.dgv_cats.Anchor = ANCHOR_ALL
         self.tab_cats.Controls.Add(self.dgv_cats)
         self.tabs.TabPages.Add(self.tab_cats)
 
@@ -2049,7 +2110,8 @@ class AuditDashboardForm(Form):
             Text=u"Показать только проблемные элементы (с незаполненными параметрами)",
             Location=Point(12, 10), Size=Size(510, 22),
             Checked=False, Font=Font("Segoe UI", 9, FontStyle.Bold),
-            ForeColor=Color.FromArgb(185, 28, 28)
+            ForeColor=Color.FromArgb(185, 28, 28),
+            Anchor=ANCHOR_TOP_LEFT
         )
         self.chk_only_failed.CheckedChanged += self.on_filter_elements_changed
         self.tab_elems.Controls.Add(self.chk_only_failed)
@@ -2057,18 +2119,26 @@ class AuditDashboardForm(Form):
         self.chk_auto_zoom = CheckBox(
             Text=u"Приближать в модели (Zoom)",
             Location=Point(525, 10), Size=Size(195, 22),
-            Checked=True, Font=Font("Segoe UI", 8.5, FontStyle.Regular)
+            Checked=True, Font=Font("Segoe UI", 8.5, FontStyle.Regular),
+            Anchor=ANCHOR_TOP_LEFT
         )
         self.tab_elems.Controls.Add(self.chk_auto_zoom)
 
-        lbl_el_search = Label(Text=u"Поиск:", Location=Point(725, 12), Size=Size(50, 20))
+        lbl_el_search = Label(
+            Text=u"Поиск:", Location=Point(725, 12), Size=Size(50, 20),
+            Anchor=ANCHOR_TOP_RIGHT
+        )
         self.tab_elems.Controls.Add(lbl_el_search)
 
-        self.tb_el_filter = TextBox(Location=Point(778, 9), Size=Size(184, 22))
+        self.tb_el_filter = TextBox(
+            Location=Point(778, 9), Size=Size(184, 22),
+            Anchor=ANCHOR_TOP_RIGHT
+        )
         self.tb_el_filter.TextChanged += self.on_filter_elements_changed
         self.tab_elems.Controls.Add(self.tb_el_filter)
 
         self.dgv_elems = self.create_styled_grid(Point(10, 38), Size(952, 412))
+        self.dgv_elems.Anchor = ANCHOR_ALL
         self.dgv_elems.CellDoubleClick += self.on_element_row_double_click
         self.tab_elems.Controls.Add(self.dgv_elems)
         self.tabs.TabPages.Add(self.tab_elems)
@@ -2080,7 +2150,8 @@ class AuditDashboardForm(Form):
         self.chk_show_zero_cats = CheckBox(
             Text=u"Показывать неактивные категории (0 элементов — серые)",
             Location=Point(12, 10), Size=Size(430, 22),
-            Checked=True, Font=Font("Segoe UI", 8.5, FontStyle.Regular)
+            Checked=True, Font=Font("Segoe UI", 8.5, FontStyle.Regular),
+            Anchor=ANCHOR_TOP_LEFT
         )
         self.chk_show_zero_cats.CheckedChanged += self.on_cat_filter_ui_changed
         self.tab_cat_filter.Controls.Add(self.chk_show_zero_cats)
@@ -2089,14 +2160,21 @@ class AuditDashboardForm(Form):
             Text=u"Мгновенно обновлять дашборд и авто-сохранять фильтр",
             Location=Point(448, 10), Size=Size(335, 22),
             Checked=True, Font=Font("Segoe UI", 8.5, FontStyle.Bold),
-            ForeColor=Color.FromArgb(22, 101, 52)
+            ForeColor=Color.FromArgb(22, 101, 52),
+            Anchor=ANCHOR_TOP_LEFT
         )
         self.tab_cat_filter.Controls.Add(self.chk_auto_recalc_cats)
 
-        lbl_cf_search = Label(Text=u"Поиск:", Location=Point(785, 12), Size=Size(48, 20))
+        lbl_cf_search = Label(
+            Text=u"Поиск:", Location=Point(785, 12), Size=Size(48, 20),
+            Anchor=ANCHOR_TOP_RIGHT
+        )
         self.tab_cat_filter.Controls.Add(lbl_cf_search)
 
-        self.tb_cat_search = TextBox(Location=Point(835, 9), Size=Size(127, 22))
+        self.tb_cat_search = TextBox(
+            Location=Point(835, 9), Size=Size(127, 22),
+            Anchor=ANCHOR_TOP_RIGHT
+        )
         self.tb_cat_search.TextChanged += self.on_cat_filter_ui_changed
         self.tab_cat_filter.Controls.Add(self.tb_cat_search)
 
@@ -2105,7 +2183,8 @@ class AuditDashboardForm(Form):
             Location=Point(12, 37), Size=Size(175, 27),
             Font=Font("Segoe UI", 8, FontStyle.Bold),
             BackColor=Color.FromArgb(239, 246, 255), ForeColor=Color.FromArgb(30, 64, 175),
-            FlatStyle=FlatStyle.Flat
+            FlatStyle=FlatStyle.Flat,
+            Anchor=ANCHOR_TOP_LEFT
         )
         btn_cf_std.Click += self.on_cat_preset_standard
         self.tab_cat_filter.Controls.Add(btn_cf_std)
@@ -2113,7 +2192,8 @@ class AuditDashboardForm(Form):
         btn_cf_all = Button(
             Text=u"Включить ВСЕ",
             Location=Point(192, 37), Size=Size(105, 27),
-            Font=Font("Segoe UI", 8, FontStyle.Regular), BackColor=Color.White
+            Font=Font("Segoe UI", 8, FontStyle.Regular), BackColor=Color.White,
+            Anchor=ANCHOR_TOP_LEFT
         )
         btn_cf_all.Click += self.on_cat_preset_all_active
         self.tab_cat_filter.Controls.Add(btn_cf_all)
@@ -2121,7 +2201,8 @@ class AuditDashboardForm(Form):
         btn_cf_none = Button(
             Text=u"Отключить все",
             Location=Point(302, 37), Size=Size(105, 27),
-            Font=Font("Segoe UI", 8, FontStyle.Regular), BackColor=Color.White
+            Font=Font("Segoe UI", 8, FontStyle.Regular), BackColor=Color.White,
+            Anchor=ANCHOR_TOP_LEFT
         )
         btn_cf_none.Click += self.on_cat_preset_none
         self.tab_cat_filter.Controls.Add(btn_cf_none)
@@ -2131,7 +2212,8 @@ class AuditDashboardForm(Form):
             Location=Point(412, 37), Size=Size(235, 27),
             Font=Font("Segoe UI", 8, FontStyle.Bold),
             BackColor=Color.FromArgb(240, 253, 244), ForeColor=Color.FromArgb(22, 101, 52),
-            FlatStyle=FlatStyle.Flat
+            FlatStyle=FlatStyle.Flat,
+            Anchor=ANCHOR_TOP_LEFT
         )
         self.btn_cf_save_cfg.Click += self.on_save_cat_filter_to_active_profile
         self.tab_cat_filter.Controls.Add(self.btn_cf_save_cfg)
@@ -2139,7 +2221,8 @@ class AuditDashboardForm(Form):
         btn_cf_exp_json = Button(
             Text=u"Экспорт конфига (.json)",
             Location=Point(652, 37), Size=Size(145, 27),
-            Font=Font("Segoe UI", 8, FontStyle.Regular), BackColor=Color.White
+            Font=Font("Segoe UI", 8, FontStyle.Regular), BackColor=Color.White,
+            Anchor=ANCHOR_TOP_LEFT
         )
         btn_cf_exp_json.Click += self.on_export_config_from_dashboard
         self.tab_cat_filter.Controls.Add(btn_cf_exp_json)
@@ -2147,12 +2230,16 @@ class AuditDashboardForm(Form):
         btn_cf_imp_json = Button(
             Text=u"Импорт (.json)",
             Location=Point(802, 37), Size=Size(160, 27),
-            Font=Font("Segoe UI", 8, FontStyle.Regular), BackColor=Color.White
+            Font=Font("Segoe UI", 8, FontStyle.Regular), BackColor=Color.White,
+            Anchor=ANCHOR_TOP_LEFT
         )
         btn_cf_imp_json.Click += self.on_import_config_from_dashboard
         self.tab_cat_filter.Controls.Add(btn_cf_imp_json)
 
-        self.dgv_cat_filter = DataGridView(Location=Point(10, 70), Size=Size(952, 382))
+        self.dgv_cat_filter = DataGridView(
+            Location=Point(10, 70), Size=Size(952, 382),
+            Anchor=ANCHOR_ALL
+        )
         self.dgv_cat_filter.AllowUserToAddRows = False
         self.dgv_cat_filter.AllowUserToDeleteRows = False
         self.dgv_cat_filter.ReadOnly = True
@@ -2201,12 +2288,13 @@ class AuditDashboardForm(Form):
 
         # --- СТРОКА ЖИВОГО СТАТУСА ---
         self.lbl_status = Label(
-            Text=u"✓ Профиль «{}» активен. Чтобы добавить другие параметры из каталога, нажмите «⚙ Параметры / Вид» вверху!".format(
+            Text=u"✓ Профиль «{}» активен. Двойной клик по строке во вкладке 3 открывает редактор параметров элемента!".format(
                 self.cfg_mgr.get_active_profile_name()
             ),
             Location=Point(14, 628), Size=Size(976, 22),
             Font=Font("Segoe UI", 9, FontStyle.Bold),
-            ForeColor=Color.FromArgb(22, 101, 52)
+            ForeColor=Color.FromArgb(22, 101, 52),
+            Anchor=ANCHOR_BOTTOM_LEFT_RIGHT
         )
         self.Controls.Add(self.lbl_status)
 
@@ -2216,7 +2304,8 @@ class AuditDashboardForm(Form):
             Location=Point(12, 656), Size=Size(195, 38),
             Font=Font("Segoe UI", 8.5, FontStyle.Bold),
             BackColor=Color.FromArgb(30, 64, 175), ForeColor=Color.White,
-            FlatStyle=FlatStyle.Flat
+            FlatStyle=FlatStyle.Flat,
+            Anchor=ANCHOR_BOTTOM_LEFT
         )
         btn_sel_rows.Click += self.on_select_highlighted_in_revit
         self.Controls.Add(btn_sel_rows)
@@ -2226,7 +2315,8 @@ class AuditDashboardForm(Form):
             Location=Point(214, 656), Size=Size(215, 38),
             Font=Font("Segoe UI", 8.5, FontStyle.Bold),
             BackColor=Color.FromArgb(180, 83, 9), ForeColor=Color.White,
-            FlatStyle=FlatStyle.Flat
+            FlatStyle=FlatStyle.Flat,
+            Anchor=ANCHOR_BOTTOM_LEFT
         )
         self.btn_sel_failed.Click += self.on_select_all_failed_in_revit
         self.Controls.Add(self.btn_sel_failed)
@@ -2236,7 +2326,8 @@ class AuditDashboardForm(Form):
             Location=Point(436, 656), Size=Size(205, 38),
             Font=Font("Segoe UI", 8.5, FontStyle.Bold),
             BackColor=Color.FromArgb(109, 40, 217), ForeColor=Color.White,
-            FlatStyle=FlatStyle.Flat
+            FlatStyle=FlatStyle.Flat,
+            Anchor=ANCHOR_BOTTOM_LEFT
         )
         btn_iso_failed.Click += self.on_isolate_in_revit
         self.Controls.Add(btn_iso_failed)
@@ -2245,7 +2336,8 @@ class AuditDashboardForm(Form):
             Text=u"Сброс изоляции (HR)",
             Location=Point(648, 656), Size=Size(135, 38),
             Font=Font("Segoe UI", 8.5, FontStyle.Regular),
-            BackColor=Color.White
+            BackColor=Color.White,
+            Anchor=ANCHOR_BOTTOM_LEFT
         )
         btn_reset_iso.Click += self.on_reset_isolation_in_revit
         self.Controls.Add(btn_reset_iso)
@@ -2254,7 +2346,8 @@ class AuditDashboardForm(Form):
             Text=u"Экспорт CSV",
             Location=Point(790, 656), Size=Size(100, 38),
             Font=Font("Segoe UI", 8.5, FontStyle.Regular),
-            BackColor=Color.White
+            BackColor=Color.White,
+            Anchor=ANCHOR_BOTTOM_LEFT
         )
         btn_csv.Click += self.on_export_csv
         self.Controls.Add(btn_csv)
@@ -2264,7 +2357,8 @@ class AuditDashboardForm(Form):
             Location=Point(897, 656), Size=Size(95, 38),
             Font=Font("Segoe UI", 8.5, FontStyle.Bold),
             BackColor=Color.FromArgb(22, 101, 52), ForeColor=Color.White,
-            FlatStyle=FlatStyle.Flat
+            FlatStyle=FlatStyle.Flat,
+            Anchor=ANCHOR_BOTTOM_RIGHT
         )
         btn_close.Click += self.on_close_click
         self.Controls.Add(btn_close)
@@ -2289,7 +2383,6 @@ class AuditDashboardForm(Form):
         was_topmost = self.TopMost
         try:
             self.auto_persist_category_states()
-            # Временно снимаем TopMost с дашборда, чтобы окно настроек гарантированно было выше по приоритету
             self.TopMost = False
             cfg_dlg = ParameterAuditConfigForm(
                 self.doc, self.cfg_mgr,
@@ -2306,7 +2399,7 @@ class AuditDashboardForm(Form):
                 saved_cats = cfg_dlg.selected_category_states
                 cfg_dlg.Dispose()
 
-                self.Text = u"Дашборд BIM-аудита v2.9 (Немодальный режим — окно Revit активно) — Вид: {}".format(self.view_name)
+                self.Text = u"Дашборд BIM-аудита v3.0 (Немодальный режим — окно Revit активно) — Вид: {}".format(self.view_name)
                 self.btn_cf_save_cfg.Text = u"Сохранить в профиль «{}»".format(self.cfg_mgr.get_active_profile_name())
                 self.raw_records, self.categories_catalog = scan_raw_view_elements(
                     self.doc, self.view_elem, self.param_names, saved_cats
@@ -2744,8 +2837,8 @@ class AuditDashboardForm(Form):
         f_btn = Font("Segoe UI", 8, FontStyle.Bold)
 
         y = 8
-        card_width = 922
-        bar_max_w = 894
+        card_width = max(880, self.pnl_bars.ClientSize.Width - 28)
+        bar_max_w = card_width - 28
 
         for idx, p_name in enumerate(self.param_names):
             st = p_stats[p_name]
@@ -2766,7 +2859,8 @@ class AuditDashboardForm(Form):
                 Location=Point(8, y),
                 Size=Size(card_width, 92),
                 BackColor=Color.FromArgb(248, 250, 252),
-                BorderStyle=BorderStyle.FixedSingle
+                BorderStyle=BorderStyle.FixedSingle,
+                Anchor=ANCHOR_TOP_LEFT_RIGHT
             )
 
             lbl_name = Label(
@@ -2790,12 +2884,13 @@ class AuditDashboardForm(Form):
             if missing_cnt > 0:
                 btn_sel_param = Button(
                     Text=u"Выделить пустые ({})".format(missing_cnt),
-                    Location=Point(756, 5),
+                    Location=Point(card_width - 166, 5),
                     Size=Size(152, 26),
                     Font=f_btn,
                     BackColor=Color.FromArgb(254, 242, 242),
                     ForeColor=Color.FromArgb(185, 28, 28),
-                    FlatStyle=FlatStyle.Flat
+                    FlatStyle=FlatStyle.Flat,
+                    Anchor=ANCHOR_TOP_RIGHT
                 )
                 btn_sel_param.Tag = p_name
                 btn_sel_param.Click += self.on_select_missing_for_param
@@ -2803,11 +2898,12 @@ class AuditDashboardForm(Form):
             else:
                 lbl_ok = Label(
                     Text=u"✓ Заполнен на 100%",
-                    Location=Point(760, 9),
+                    Location=Point(card_width - 162, 9),
                     Size=Size(145, 20),
                     Font=f_btn,
                     ForeColor=Color.FromArgb(22, 163, 74),
-                    TextAlign=ContentAlignment.MiddleRight
+                    TextAlign=ContentAlignment.MiddleRight,
+                    Anchor=ANCHOR_TOP_RIGHT
                 )
                 card.Controls.Add(lbl_ok)
 
@@ -2833,13 +2929,15 @@ class AuditDashboardForm(Form):
                 Size=Size(bar_max_w, 20),
                 Font=f_meta,
                 ForeColor=Color.FromArgb(71, 85, 105),
-                AutoEllipsis=True
+                AutoEllipsis=True,
+                Anchor=ANCHOR_TOP_LEFT_RIGHT
             )
             card.Controls.Add(lbl_examples)
 
             self.pnl_bars.Controls.Add(card)
             y += 100
 
+        self.pnl_bars.AutoScrollMinSize = Size(850, y + 10)
         self.pnl_bars.ResumeLayout()
 
     def on_select_missing_for_param(self, sender, event):
@@ -2853,7 +2951,7 @@ class AuditDashboardForm(Form):
         self.select_ids_non_blocking(ids_list, custom_param_name=p_name)
 
     def get_param_column_header(self, p_name):
-        """Формирует заголовок столбца с типом параметра в шапке: напр. MR_Этаж [Э] или MR_Код [Т]."""
+        """Формирует заголовок столбца с типом параметра в шапке: напр. Код по классификатору [Т] или Марка [Э]."""
         st = self.audit_data['param_stats'].get(p_name, {})
         scopes = st.get('scopes', set())
         short_tags = []
@@ -2933,7 +3031,6 @@ class AuditDashboardForm(Form):
             if not item['is_ok']:
                 r_obj.DefaultCellStyle.BackColor = Color.FromArgb(254, 242, 242)
 
-
     def on_element_row_double_click(self, sender, event):
         """Открывает карточку редактирования параметров элемента при двойном клике по строке ведомости."""
         if event.RowIndex < 0:
@@ -2946,7 +3043,6 @@ class AuditDashboardForm(Form):
                 self.set_status_message(u"Элемент ID {} не найден в модели.".format(el_id_int), Color.FromArgb(185, 28, 28))
                 return
 
-            # Выделяем элемент в Revit, чтобы проектировщик видел его
             try:
                 ids_sel = List[ElementId]()
                 ids_sel.Add(target_el.Id)
@@ -2970,7 +3066,6 @@ class AuditDashboardForm(Form):
                     pass
 
             if dlg_res == DialogResult.OK and changes:
-                # Пробуем записать через прямую транзакцию, а если контекст немодальный — через ExternalEvent
                 wrote_directly = False
                 try:
                     t = Transaction(self.doc, u"BIM Аудит: Запись значений параметров")
@@ -3007,7 +3102,6 @@ class AuditDashboardForm(Form):
             target_el = self.doc.GetElement(ElementId(int(el_id_int)))
             target_type_id = target_el.GetTypeId() if target_el else None
 
-            # Перечитываем параметры у измененного элемента (и у элементов того же типа, если менялся параметр Типа)
             for rec in self.raw_records:
                 el_obj = rec['element']
                 if rec['id_int'] == int(el_id_int) or (target_type_id and el_obj.GetTypeId() == target_type_id):
