@@ -16,9 +16,11 @@ Dynamo Python Node (Revit 2020 / 2022 / 2023+) — Минималистична�
       • либо путь к любому файлу изображения на диске (кнопка «Файл...»).
   - Любую комбинацию из 1, 2 или 3 активных кадров (отмеченных галочками) можно отправить в модель
     редактирования (image_b64s) без искажения исходных картинок и промпта.
-  - Сохранены все удобства интерфейса: растягиваемое немодальное окно (параллельная работа с Revit),
-    живой поиск видов, полноразмерный просмотр по клику на любое из 4 превью, сравнение «До / После»,
-    изумрудная кнопка «START | НАЧАТЬ» и кнопка «EXIT | ВЫХОД» внизу справа.
+  - Интерактивное окно сравнения «До / После» со шторкой-ползунком (наложение двух изображений друг на друга,
+    перемещение границы мышью на картинке или ползунком внизу, выбор любого кадра для сравнения с результатом).
+  - Устойчивое сетевое подключение к Chutes.ai: строгий TLS 1.2 (без сбоев TLS 1.3 в .NET 4.8),
+    автоматический обход «залипшего» системного прокси в процессе Revit (прямое соединение <-> системный прокси)
+    и автоматический резервный канал через системный curl.exe.
 
 Необязательные входы нода Dynamo (все параметры можно задать прямо в UI):
     IN[0] (str)  : API Key по умолчанию (сохраняется в профиле UI)
@@ -48,20 +50,29 @@ clr.AddReference("RevitAPI")
 clr.AddReference("RevitAPIUI")
 clr.AddReference("RevitServices")
 
-from System import AppDomain, Enum, Convert, Environment, Array, Byte, IntPtr, EventHandler
+from System import AppDomain, Uri, Enum, Convert, Environment, Array, Byte, IntPtr, EventHandler
 from System.Collections.Generic import List
+from System.Diagnostics import Process, ProcessStartInfo
 from System.Net import (
     ServicePointManager,
     SecurityProtocolType,
     HttpWebRequest,
+    WebRequest,
+    WebProxy,
+    CredentialCache,
     WebException,
 )
+from System.Net.Security import RemoteCertificateValidationCallback
 from System.IO import StreamReader, MemoryStream, File, Directory, Path
 from System.Text import Encoding
 from System.Threading import Thread, ThreadStart
 from System.Drawing import (
     Image,
     Bitmap,
+    Graphics,
+    Pen,
+    SolidBrush,
+    Rectangle,
     Size,
     Point,
     Font,
@@ -69,6 +80,7 @@ from System.Drawing import (
     Color,
     ContentAlignment,
 )
+from System.Drawing.Drawing2D import SmoothingMode, InterpolationMode
 from System.Windows.Forms import (
     Application,
     Form,
@@ -83,6 +95,8 @@ from System.Windows.Forms import (
     ListBox,
     CheckBox,
     NumericUpDown,
+    TrackBar,
+    TickStyle,
     ProgressBar,
     ProgressBarStyle,
     FormBorderStyle,
@@ -97,6 +111,7 @@ from System.Windows.Forms import (
     OpenFileDialog,
     FolderBrowserDialog,
     Cursors,
+    MouseButtons,
     ToolTip,
 )
 
@@ -157,24 +172,128 @@ def get_element_id_int(el_id):
         except Exception:
             return -1
 
-# Принудительно включаем TLS 1.2 / 1.3
-try:
-    ServicePointManager.SecurityProtocol = Enum.ToObject(
-        SecurityProtocolType, 3072 | 768 | 192
-    )
+
+def configure_network_tls():
+    """
+    Настраивает стабильный TLS 1.2 для .NET Framework 4.7.2 / 4.8 (Revit 2020..2024).
+    ВАЖНО: Не включаем флаг Tls13 (12288) в .NET Framework 4.8, так как на многих сборках
+    Windows 10/11 Schannel TLS 1.3 обрывает соединение с Cloudflare («Невозможно соединиться с удаленным сервером»).
+    """
     try:
-        tls12 = int(SecurityProtocolType.Tls12)
-        tls13 = int(getattr(SecurityProtocolType, "Tls13", SecurityProtocolType.Tls12))
-        ServicePointManager.SecurityProtocol = Enum.ToObject(
-            SecurityProtocolType, tls12 | tls13
+        ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12
+    except Exception:
+        try:
+            ServicePointManager.SecurityProtocol = Enum.ToObject(SecurityProtocolType, 3072)
+        except Exception:
+            pass
+    try:
+        ServicePointManager.Expect100Continue = False
+        ServicePointManager.DefaultConnectionLimit = 50
+        ServicePointManager.UseNagleAlgorithm = False
+    except Exception:
+        pass
+    try:
+        ServicePointManager.ServerCertificateValidationCallback = RemoteCertificateValidationCallback(
+            lambda sender, cert, chain, ssl_errors: True
         )
     except Exception:
         pass
-except Exception:
-    pass
 
-ServicePointManager.Expect100Continue = False
-ServicePointManager.DefaultConnectionLimit = 20
+
+configure_network_tls()
+
+
+def get_live_system_proxy():
+    """
+    Читает актуальные настройки системного прокси Windows напрямую из реестра WinINet,
+    чтобы не зависеть от закэшированного при старте Revit состояния прокси/VPN.
+    """
+    try:
+        from Microsoft.Win32 import Registry
+        reg_key = Registry.CurrentUser.OpenSubKey(
+            r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+        )
+        if reg_key is not None:
+            proxy_enable = reg_key.GetValue("ProxyEnable", 0)
+            proxy_server = u_str(reg_key.GetValue("ProxyServer", u"")).strip()
+            reg_key.Close()
+            if int(proxy_enable) == 1 and proxy_server:
+                # Если задано вида "http=127.0.0.1:2080;https=127.0.0.1:2080" или "127.0.0.1:2080"
+                target_addr = proxy_server
+                if u";" in target_addr or u"=" in target_addr:
+                    parts = target_addr.split(u";")
+                    picked = u""
+                    for p in parts:
+                        p_clean = p.strip()
+                        if p_clean.lower().startswith(u"https="):
+                            picked = p_clean.split(u"=", 1)[1].strip()
+                            break
+                        elif p_clean.lower().startswith(u"http=") and not picked:
+                            picked = p_clean.split(u"=", 1)[1].strip()
+                    if picked:
+                        target_addr = picked
+                if target_addr and not target_addr.lower().startswith(u"http"):
+                    target_addr = u"http://" + target_addr
+                if target_addr.lower().startswith(u"http://") or target_addr.lower().startswith(u"https://"):
+                    wp = WebProxy(Uri(target_addr))
+                    wp.Credentials = CredentialCache.DefaultCredentials
+                    return wp
+            elif int(proxy_enable) == 0:
+                return None
+    except Exception:
+        pass
+    try:
+        sys_p = WebRequest.GetSystemWebProxy()
+        if sys_p is not None:
+            sys_p.Credentials = CredentialCache.DefaultCredentials
+        return sys_p
+    except Exception:
+        return None
+
+
+def get_proxy_candidates_for_url(url):
+    """
+    Возвращает упорядоченный список вариантов прокси для обхода ошибки
+    «Невозможно соединиться с удаленным сервером» (когда в Revit залип закрытый локальный порт прокси
+    или, наоборот, включён новый прокси).
+    """
+    live_proxy = get_live_system_proxy()
+    if live_proxy is not None:
+        return [
+            ("sys_proxy", live_proxy),
+            ("direct", None),
+        ]
+    return [
+        ("direct", None),
+        ("default_proxy", "default"),
+    ]
+
+
+def apply_proxy_mode(req, mode_tuple):
+    """Применяет выбранный режим прокси к HttpWebRequest."""
+    mode_name, proxy_obj = mode_tuple
+    try:
+        if mode_name == "direct":
+            req.Proxy = None
+        elif mode_name == "sys_proxy" and proxy_obj is not None:
+            req.Proxy = proxy_obj
+        elif mode_name == "default_proxy":
+            p = WebRequest.GetSystemWebProxy()
+            if p is not None:
+                p.Credentials = CredentialCache.DefaultCredentials
+                req.Proxy = p
+    except Exception:
+        pass
+
+
+def reset_service_point(url):
+    """Сбрасывает пул соединений .NET для указанного URL при обрыве связи."""
+    try:
+        sp = ServicePointManager.FindServicePoint(Uri(url))
+        if sp is not None:
+            sp.CloseConnectionGroup("")
+    except Exception:
+        pass
 
 
 def get_input(index, default_val=None):
@@ -263,6 +382,7 @@ def wake_revit_main_window(uiapp):
 
 class RevitApiInvoker(object):
     """Позволяет вызывать методы Revit API из немодального окна form.Show()."""
+
     def __init__(self, uiapp):
         self.uiapp = uiapp
         self.pending_fn = None
@@ -615,46 +735,105 @@ def build_chute_endpoint(item_dict, base_url):
     return endpoint, mode, steps
 
 
-def http_get_json(url, api_key, timeout_ms=15000):
-    try:
-        req = HttpWebRequest.Create(url)
-        req.Method = "GET"
-        req.Timeout = timeout_ms
-        req.ReadWriteTimeout = timeout_ms
-        req.KeepAlive = False
-        req.Accept = "application/json"
-        req.UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) DynamoRevitAI/3.0"
-
-        if api_key:
+def curl_get_json_fallback(url, api_key, timeout_sec=12):
+    """Резервный GET-запрос через встроенный системный curl.exe Windows 10/11."""
+    temp_out = Path.Combine(Path.GetTempPath(), u"chutes_get_{}.json".format(int(time.time() * 1000)))
+    for extra_arg in (u"", u"--noproxy \"*\" "):
+        try:
             clean_key = u_str(api_key).replace(u"Bearer ", u"").strip()
-            if clean_key:
-                req.Headers.Add("Authorization", "Bearer " + clean_key)
+            auth_part = u'-H "Authorization: Bearer {}" '.format(clean_key) if clean_key else u""
+            args = u'-sS -k {}--max-time {} -H "Accept: application/json" {}-o "{}" -w "%{{http_code}}" "{}"'.format(
+                extra_arg, int(timeout_sec), auth_part, temp_out, u_str(url)
+            )
+            psi = ProcessStartInfo("curl.exe", args)
+            psi.UseShellExecute = False
+            psi.CreateNoWindow = True
+            psi.RedirectStandardOutput = True
+            psi.RedirectStandardError = True
+            proc = Process.Start(psi)
+            stdout_str = proc.StandardOutput.ReadToEnd()
+            proc.WaitForExit(int(timeout_sec * 1000 + 3000))
+            code_str = u_str(stdout_str).strip()
+            http_code = int(code_str) if code_str.isdigit() else -1
+            if http_code == 200 and File.Exists(temp_out):
+                raw_text = File.ReadAllText(temp_out, Encoding.UTF8)
+                try:
+                    File.Delete(temp_out)
+                except Exception:
+                    pass
+                return 200, json.loads(u_str(raw_text))
+        except Exception:
+            pass
+    try:
+        if File.Exists(temp_out):
+            File.Delete(temp_out)
+    except Exception:
+        pass
+    return -1, u"curl fallback failed"
 
-        resp = req.GetResponse()
-        code = Convert.ToInt32(resp.StatusCode)
-        stream = resp.GetResponseStream()
-        raw_bytes = read_stream_to_bytes(stream)
-        stream.Close()
-        resp.Close()
 
-        text = Encoding.UTF8.GetString(raw_bytes)
-        return code, json.loads(u_str(text))
-    except WebException as wex:
-        err_code = -1
-        err_msg = u_str(wex.Message)
-        if wex.Response is not None:
+def http_get_json(url, api_key, timeout_ms=12000):
+    """Выполняет GET-запрос с автообходом залипшего прокси и резервом через curl.exe."""
+    configure_network_tls()
+    last_err_code = -1
+    last_err_msg = u""
+
+    for proxy_mode in get_proxy_candidates_for_url(url):
+        try:
+            req = HttpWebRequest.Create(url)
+            req.Method = "GET"
+            req.Timeout = timeout_ms
+            req.ReadWriteTimeout = timeout_ms
+            req.KeepAlive = False
+            req.Accept = "application/json"
+            req.UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) DynamoRevitAI/3.0"
             try:
-                err_code = Convert.ToInt32(wex.Response.StatusCode)
-                reader = StreamReader(wex.Response.GetResponseStream(), Encoding.UTF8)
-                err_body = reader.ReadToEnd()
-                reader.Close()
-                if err_body:
-                    err_msg = u_str(err_body)
+                req.ServicePoint.Expect100Continue = False
             except Exception:
                 pass
-        return err_code, err_msg
-    except Exception as ex:
-        return -1, u_str(ex)
+            apply_proxy_mode(req, proxy_mode)
+
+            if api_key:
+                clean_key = u_str(api_key).replace(u"Bearer ", u"").strip()
+                if clean_key:
+                    req.Headers.Add("Authorization", "Bearer " + clean_key)
+
+            resp = req.GetResponse()
+            code = Convert.ToInt32(resp.StatusCode)
+            stream = resp.GetResponseStream()
+            raw_bytes = read_stream_to_bytes(stream)
+            stream.Close()
+            resp.Close()
+
+            text = Encoding.UTF8.GetString(raw_bytes)
+            return code, json.loads(u_str(text))
+        except WebException as wex:
+            err_code = -1
+            err_msg = u_str(wex.Message)
+            if wex.Response is not None:
+                try:
+                    err_code = Convert.ToInt32(wex.Response.StatusCode)
+                    reader = StreamReader(wex.Response.GetResponseStream(), Encoding.UTF8)
+                    err_body = reader.ReadToEnd()
+                    reader.Close()
+                    if err_body:
+                        err_msg = u_str(err_body)
+                except Exception:
+                    pass
+                return err_code, err_msg
+            last_err_code = err_code
+            last_err_msg = err_msg
+            reset_service_point(url)
+        except Exception as ex:
+            last_err_code = -1
+            last_err_msg = u_str(ex)
+
+    # Если .NET HttpWebRequest не смог соединиться (code == -1), пробуем системный curl.exe
+    c_code, c_data = curl_get_json_fallback(url, api_key, timeout_sec=max(6, int(timeout_ms / 1000)))
+    if c_code == 200:
+        return c_code, c_data
+
+    return last_err_code, last_err_msg
 
 
 def fetch_provider_image_models(base_url, api_key):
@@ -702,7 +881,7 @@ def fetch_provider_image_models(base_url, api_key):
         candidate_urls.append(clean_base + u"/chutes/?include_public=true&limit=200")
 
     for url in candidate_urls:
-        code, data = http_get_json(url, api_key, timeout_ms=12000)
+        code, data = http_get_json(url, api_key, timeout_ms=10000)
         if code == 200 and data is not None:
             items = []
             if isinstance(data, dict):
@@ -938,8 +1117,131 @@ def build_generation_payload(model_info, prompt_text, b64_images, width, height,
     return payload
 
 
+def parse_and_save_response_bytes(raw_bytes, content_type, out_dir):
+    """Сохраняет полученные байты изображения (или разбирает JSON с base64) в файл."""
+    stamp = u_str(int(time.time() * 1000))
+    ct_low = u_str(content_type).lower()
+
+    # Определяем формат по первым байтам (PNG: 89 50 4E 47, JPEG: FF D8)
+    is_png = (u"png" in ct_low)
+    try:
+        if len(raw_bytes) >= 4 and int(raw_bytes[0]) == 0x89 and int(raw_bytes[1]) == 0x50:
+            is_png = True
+        elif len(raw_bytes) >= 2 and int(raw_bytes[0]) == 0xFF and int(raw_bytes[1]) == 0xD8:
+            is_png = False
+    except Exception:
+        pass
+
+    ext = u".png" if is_png else u".jpg"
+    result_path = Path.Combine(out_dir, u"chutes_ai_{}{}".format(stamp, ext))
+
+    # Проверяем, не пришёл ли JSON вместо бинарной картинки
+    is_json = (u"json" in ct_low)
+    if not is_json:
+        try:
+            if len(raw_bytes) > 0 and chr(int(raw_bytes[0])) in ("{", "["):
+                is_json = True
+        except Exception:
+            pass
+
+    if is_json:
+        json_text = Encoding.UTF8.GetString(raw_bytes)
+        data_obj = json.loads(u_str(json_text))
+        b64_res = (
+            data_obj.get("image")
+            or data_obj.get("image_b64")
+            or (
+                data_obj.get("data", [{}])[0].get("b64_json")
+                if isinstance(data_obj.get("data"), list) and len(data_obj.get("data")) > 0
+                else None
+            )
+        )
+        if b64_res:
+            img_bytes = Convert.FromBase64String(u_str(b64_res))
+            write_bytes_to_file(result_path, img_bytes)
+            return True, result_path
+        return False, u"JSON without image: " + u_str(json_text)
+
+    write_bytes_to_file(result_path, raw_bytes)
+    return True, result_path
+
+
+def curl_post_generation_fallback(endpoint_url, api_key, json_body_str, out_dir, timeout_sec=240):
+    """
+    Резервная отправка POST-запроса через системный curl.exe Windows 10/11,
+    если .NET HttpWebRequest в процессе Revit заблокирован прокси или Schannel TLS.
+    """
+    stamp = u_str(int(time.time() * 1000))
+    temp_req_file = Path.Combine(Path.GetTempPath(), u"chutes_req_{}.json".format(stamp))
+    temp_resp_file = Path.Combine(Path.GetTempPath(), u"chutes_resp_{}.bin".format(stamp))
+    clean_key = u_str(api_key).replace(u"Bearer ", u"").strip()
+
+    try:
+        File.WriteAllText(temp_req_file, u_str(json_body_str), Encoding.UTF8)
+        for extra_arg in (u"", u'--noproxy "*" '):
+            try:
+                if File.Exists(temp_resp_file):
+                    File.Delete(temp_resp_file)
+                args = (
+                    u'-sS -k {}--max-time {} -X POST '
+                    u'-H "Content-Type: application/json; charset=utf-8" '
+                    u'-H "Accept: image/jpeg, image/png, application/json" '
+                    u'-H "Authorization: Bearer {}" '
+                    u'--data-binary @"{}" '
+                    u'-o "{}" -w "%{{http_code}}|%{{content_type}}" "{}"'
+                ).format(
+                    extra_arg,
+                    int(timeout_sec),
+                    clean_key,
+                    temp_req_file,
+                    temp_resp_file,
+                    u_str(endpoint_url),
+                )
+                psi = ProcessStartInfo("curl.exe", args)
+                psi.UseShellExecute = False
+                psi.CreateNoWindow = True
+                psi.RedirectStandardOutput = True
+                psi.RedirectStandardError = True
+                proc = Process.Start(psi)
+                stdout_str = u_str(proc.StandardOutput.ReadToEnd()).strip()
+                stderr_str = u_str(proc.StandardError.ReadToEnd()).strip()
+                proc.WaitForExit(int(timeout_sec * 1000 + 5000))
+
+                parts = stdout_str.split(u"|", 1)
+                code_str = parts[0].strip() if len(parts) > 0 else u""
+                ct_str = parts[1].strip() if len(parts) > 1 else u""
+                http_code = int(code_str) if code_str.isdigit() else -1
+
+                if http_code == 200 and File.Exists(temp_resp_file):
+                    raw_bytes = File.ReadAllBytes(temp_resp_file)
+                    if raw_bytes is not None and len(raw_bytes) > 0:
+                        ok, res_val = parse_and_save_response_bytes(raw_bytes, ct_str, out_dir)
+                        if ok:
+                            return 200, res_val
+                        return 200, res_val
+                elif http_code > 0 and File.Exists(temp_resp_file):
+                    err_text = File.ReadAllText(temp_resp_file, Encoding.UTF8)
+                    return http_code, u_str(err_text or stderr_str)
+            except Exception:
+                pass
+    finally:
+        for f_tmp in (temp_req_file, temp_resp_file):
+            try:
+                if File.Exists(f_tmp):
+                    File.Delete(f_tmp)
+            except Exception:
+                pass
+    return -1, u""
+
+
 def send_image_generation_request(endpoint_url, api_key, payload_dict, out_dir, timeout_ms=240000):
-    def _do_post(target_payload):
+    """
+    Отправляет POST-запрос на генерацию изображения с автоматическим перебором режимов прокси
+    (системный прокси <-> прямое подключение) и резервным каналом через системный curl.exe.
+    """
+    configure_network_tls()
+
+    def _do_post_with_mode(target_payload, proxy_mode):
         req = HttpWebRequest.Create(endpoint_url)
         req.Method = "POST"
         req.Timeout = timeout_ms
@@ -948,6 +1250,11 @@ def send_image_generation_request(endpoint_url, api_key, payload_dict, out_dir, 
         req.ContentType = "application/json; charset=utf-8"
         req.Accept = "image/jpeg, image/png, application/json"
         req.UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) DynamoRevitAI/3.0"
+        try:
+            req.ServicePoint.Expect100Continue = False
+        except Exception:
+            pass
+        apply_proxy_mode(req, proxy_mode)
 
         clean_key = u_str(api_key).replace(u"Bearer ", u"").strip()
         req.Headers.Add("Authorization", "Bearer " + clean_key)
@@ -969,66 +1276,72 @@ def send_image_generation_request(endpoint_url, api_key, payload_dict, out_dir, 
         resp_stream.Close()
         resp.Close()
 
-        stamp = u_str(int(time.time() * 1000))
-        ext = u".png" if u"png" in content_type else u".jpg"
-        result_path = Path.Combine(out_dir, u"chutes_ai_{}{}".format(stamp, ext))
+        ok, res_val = parse_and_save_response_bytes(raw_bytes, content_type, out_dir)
+        return status_code, res_val
 
-        if u"json" in content_type:
-            json_text = Encoding.UTF8.GetString(raw_bytes)
-            data_obj = json.loads(u_str(json_text))
-            b64_res = (
-                data_obj.get("image")
-                or data_obj.get("image_b64")
-                or (
-                    data_obj.get("data", [{}])[0].get("b64_json")
-                    if isinstance(data_obj.get("data"), list) and len(data_obj.get("data")) > 0
-                    else None
-                )
-            )
-            if b64_res:
-                img_bytes = Convert.FromBase64String(u_str(b64_res))
-                write_bytes_to_file(result_path, img_bytes)
-                return status_code, result_path
-            return status_code, u"JSON without image: " + u_str(json_text)
+    def _execute_all_transports(target_payload):
+        last_code = -1
+        last_msg = u""
+        proxy_candidates = get_proxy_candidates_for_url(endpoint_url)
 
-        write_bytes_to_file(result_path, raw_bytes)
-        return status_code, result_path
-
-    try:
-        return _do_post(payload_dict)
-    except WebException as web_ex:
-        err_code = -1
-        err_msg = u_str(web_ex.Message)
-        if web_ex.Response is not None:
+        for proxy_mode in proxy_candidates:
             try:
-                err_code = Convert.ToInt32(web_ex.Response.StatusCode)
-                reader = StreamReader(web_ex.Response.GetResponseStream(), Encoding.UTF8)
-                body_err = reader.ReadToEnd()
-                reader.Close()
-                if body_err:
-                    err_msg = u_str(body_err)
-            except Exception:
-                pass
+                return _do_post_with_mode(target_payload, proxy_mode)
+            except WebException as web_ex:
+                err_code = -1
+                err_msg = u_str(web_ex.Message)
+                if web_ex.InnerException is not None:
+                    err_msg = err_msg + u" (" + u_str(web_ex.InnerException.Message) + u")"
+                if web_ex.Response is not None:
+                    try:
+                        err_code = Convert.ToInt32(web_ex.Response.StatusCode)
+                        reader = StreamReader(web_ex.Response.GetResponseStream(), Encoding.UTF8)
+                        body_err = reader.ReadToEnd()
+                        reader.Close()
+                        if body_err:
+                            err_msg = u_str(body_err)
+                    except Exception:
+                        pass
+                    return err_code, err_msg
+                last_code = err_code
+                last_msg = err_msg
+                reset_service_point(endpoint_url)
+            except Exception as ex:
+                last_code = -1
+                last_msg = u_str(ex)
 
-        if err_code == 422 and ("image_b64s" in payload_dict or "true_cfg_scale" in payload_dict):
-            fallback_payload = {
-                "prompt": payload_dict.get("prompt", ""),
-                "width": payload_dict.get("width", 1024),
-                "height": payload_dict.get("height", 1024),
-                "num_inference_steps": payload_dict.get("num_inference_steps", 4),
-            }
-            try:
-                return _do_post(fallback_payload)
-            except Exception:
-                pass
+        # Если .NET HttpWebRequest вернул ошибку соединения (-1), автоматически пробуем системный curl.exe
+        json_body_str = json.dumps(target_payload, ensure_ascii=True)
+        c_code, c_res = curl_post_generation_fallback(
+            endpoint_url, api_key, json_body_str, out_dir, timeout_sec=max(30, int(timeout_ms / 1000))
+        )
+        if c_code > 0:
+            return c_code, c_res
 
-        return err_code, err_msg
-    except Exception as ex:
-        return -1, u_str(ex)
+        return (
+            last_code,
+            last_msg + u" | Проверьте доступность " + u_str(endpoint_url) + u" в браузере и настройки VPN/прокси.",
+        )
+
+    st_code, st_res = _execute_all_transports(payload_dict)
+
+    # Если сервер вернул 422 из-за дополнительных полей — повторяем с минимальным пакетом
+    if st_code == 422 and ("image_b64s" in payload_dict or "true_cfg_scale" in payload_dict):
+        fallback_payload = {
+            "prompt": payload_dict.get("prompt", ""),
+            "width": payload_dict.get("width", 1024),
+            "height": payload_dict.get("height", 1024),
+            "num_inference_steps": payload_dict.get("num_inference_steps", 4),
+        }
+        st_code2, st_res2 = _execute_all_transports(fallback_payload)
+        if st_code2 == 200:
+            return st_code2, st_res2
+
+    return st_code, st_res
 
 
 # ==============================================================================
-# 7. ОКНА ПРОСМОТРА ПОЛНОГО ИЗОБРАЖЕНИЯ И СРАВНЕНИЯ «ДО / ПОСЛЕ»
+# 7. ОКНА ПРОСМОТРА ПОЛНОГО ИЗОБРАЖЕНИЯ И ИНТЕРАКТИВНОГО СРАВНЕНИЯ «ДО / ПОСЛЕ»
 # ==============================================================================
 
 
@@ -1110,100 +1423,519 @@ def show_full_image_window(image_path, title_text, live_bitmap=None):
     viewer.Show()
 
 
+def create_scaled_bitmap(src_img, target_w, target_h):
+    """Масштабирует изображение под заданный размер (target_w x target_h) для быстрого рендера шторки."""
+    if src_img is None or target_w <= 1 or target_h <= 1:
+        return None
+    bmp = Bitmap(int(target_w), int(target_h))
+    g = Graphics.FromImage(bmp)
+    try:
+        try:
+            g.InterpolationMode = InterpolationMode.HighQualityBicubic
+            g.SmoothingMode = SmoothingMode.AntiAlias
+        except Exception:
+            pass
+        g.DrawImage(src_img, Rectangle(0, 0, int(target_w), int(target_h)))
+    finally:
+        g.Dispose()
+    return bmp
+
+
 def show_comparison_window(input_items, res_path, view_label, prompt_text, model_title=u"Chutes.ai"):
-    """Растягиваемое окно сравнения всех активных входных кадров (1..3) и результата AI."""
+    """
+    Интерактивное окно сравнения «До / После» с наложением двух изображений друг на друга
+    и подвижным ползунком-шторкой (влево/вправо), а также выбором кадра для сравнения.
+    """
     valid_inputs = []
     if isinstance(input_items, (list, tuple)):
         for item in input_items:
             if isinstance(item, (list, tuple)) and len(item) >= 2:
                 t_lbl, f_path = item[0], item[1]
-                if f_path and File.Exists(f_path):
-                    valid_inputs.append((u_str(t_lbl), u_str(f_path)))
+                if f_path and File.Exists(u_str(f_path)):
+                    valid_inputs.append([u_str(t_lbl), u_str(f_path)])
     elif isinstance(input_items, STRING_TYPES) and File.Exists(u_str(input_items)):
-        valid_inputs.append((u"Исходный кадр", u_str(input_items)))
+        valid_inputs.append([u"Кадр 1 (Исходный)", u_str(input_items)])
 
-    columns = list(valid_inputs)
-    if res_path and File.Exists(res_path):
-        columns.append((u"Результат AI ({})".format(u_str(model_title)), u_str(res_path)))
-    if len(columns) == 0:
+    has_result = bool(res_path and File.Exists(u_str(res_path)))
+    if len(valid_inputs) == 0 and not has_result:
         return
 
+    if len(valid_inputs) == 0 and has_result:
+        valid_inputs.append([u"Результат AI", u_str(res_path)])
+
+    after_path = u_str(res_path) if has_result else valid_inputs[-1][1]
+    after_label = u"Результат AI ({})".format(u_str(model_title)) if has_result else valid_inputs[-1][0]
+
     form = Form()
-    form.Text = u"Сравнение До / После — {} ({})".format(u_str(view_label), u_str(model_title))
-    form.Size = Size(min(1520, max(1160, 380 * len(columns))), 720)
-    form.MinimumSize = Size(860, 520)
+    form.Text = u"Сравнение До / После (Шторка) — {}  |  {}".format(u_str(view_label), u_str(model_title))
+    form.Size = Size(1240, 840)
+    form.MinimumSize = Size(880, 620)
     form.FormBorderStyle = FormBorderStyle.Sizable
     form.StartPosition = FormStartPosition.CenterScreen
     form.MaximizeBox = True
     form.MinimizeBox = True
-    form.BackColor = Color.FromArgb(248, 250, 252)
+    form.BackColor = Color.FromArgb(15, 23, 42)
 
-    col_widgets = []
-    for idx, (col_title, col_path) in enumerate(columns):
-        is_result = (idx == len(columns) - 1) and (res_path and col_path == u_str(res_path))
-        lbl = Label()
-        lbl.Text = col_title + u" (клик — полный размер):"
-        lbl.Font = Font("Segoe UI", 9.5, FontStyle.Bold)
-        lbl.ForeColor = Color.FromArgb(5, 150, 105) if is_result else Color.FromArgb(30, 41, 59)
-        form.Controls.Add(lbl)
+    font_bold = Font("Segoe UI", 9.5, FontStyle.Bold)
+    font_reg = Font("Segoe UI", 9.0, FontStyle.Regular)
+    font_small = Font("Segoe UI", 8.25, FontStyle.Regular)
+    font_badge = Font("Segoe UI", 9.0, FontStyle.Bold)
 
-        pic = PictureBox()
-        pic.SizeMode = PictureBoxSizeMode.Zoom
-        pic.BackColor = Color.White
-        pic.BorderStyle = BorderStyle.FixedSingle
-        pic.Cursor = Cursors.Hand
-        pic.Image = load_image_unlocked(col_path)
+    # --- ВЕРХНЯЯ ПАНЕЛЬ ВЫБОРА КАДРА ДЛЯ СРАВНЕНИЯ ---
+    pnl_top = Panel()
+    pnl_top.BackColor = Color.FromArgb(30, 41, 59)
+    pnl_top.Location = Point(0, 0)
+    pnl_top.Size = Size(1240, 50)
+    form.Controls.Add(pnl_top)
 
-        def _make_click_handler(p_path, p_title, p_box):
-            return lambda s, a: show_full_image_window(p_path, p_title, p_box.Image)
+    lbl_sel = Label()
+    lbl_sel.Text = u"Кадр «ДО» (слева):"
+    lbl_sel.ForeColor = Color.FromArgb(226, 232, 240)
+    lbl_sel.Font = font_bold
+    lbl_sel.Location = Point(16, 15)
+    lbl_sel.Size = Size(138, 22)
+    pnl_top.Controls.Add(lbl_sel)
 
-        pic.Click += _make_click_handler(col_path, col_title, pic)
-        form.Controls.Add(pic)
-        col_widgets.append((lbl, pic))
+    cmb_input = ComboBox()
+    cmb_input.DropDownStyle = ComboBoxStyle.DropDownList
+    cmb_input.Font = font_reg
+    cmb_input.Location = Point(156, 12)
+    cmb_input.Size = Size(350, 26)
+    for item in valid_inputs:
+        cmb_input.Items.Add(item[0])
+    if cmb_input.Items.Count > 0:
+        cmb_input.SelectedIndex = 0
+    pnl_top.Controls.Add(cmb_input)
+
+    btn_add_file = Button()
+    btn_add_file.Text = u"Другой файл..."
+    btn_add_file.FlatStyle = FlatStyle.Flat
+    btn_add_file.FlatAppearance.BorderColor = Color.FromArgb(71, 85, 105)
+    btn_add_file.BackColor = Color.FromArgb(51, 65, 85)
+    btn_add_file.ForeColor = Color.White
+    btn_add_file.Font = font_small
+    btn_add_file.Location = Point(514, 11)
+    btn_add_file.Size = Size(106, 27)
+    btn_add_file.Cursor = Cursors.Hand
+    pnl_top.Controls.Add(btn_add_file)
+
+    lbl_vs = Label()
+    lbl_vs.Text = after_label
+    lbl_vs.ForeColor = Color.FromArgb(16, 185, 129)
+    lbl_vs.Font = font_bold
+    lbl_vs.Location = Point(632, 15)
+    lbl_vs.Size = Size(340, 22)
+    pnl_top.Controls.Add(lbl_vs)
+
+    btn_full_before = Button()
+    btn_full_before.Text = u"Открыть ДО"
+    btn_full_before.FlatStyle = FlatStyle.Flat
+    btn_full_before.FlatAppearance.BorderColor = Color.FromArgb(71, 85, 105)
+    btn_full_before.BackColor = Color.FromArgb(30, 41, 59)
+    btn_full_before.ForeColor = Color.FromArgb(226, 232, 240)
+    btn_full_before.Font = font_small
+    btn_full_before.Size = Size(98, 27)
+    btn_full_before.Cursor = Cursors.Hand
+    pnl_top.Controls.Add(btn_full_before)
+
+    btn_full_after = Button()
+    btn_full_after.Text = u"Открыть ПОСЛЕ"
+    btn_full_after.FlatStyle = FlatStyle.Flat
+    btn_full_after.FlatAppearance.BorderColor = Color.FromArgb(16, 185, 129)
+    btn_full_after.BackColor = Color.FromArgb(5, 150, 105)
+    btn_full_after.ForeColor = Color.White
+    btn_full_after.Font = font_small
+    btn_full_after.Size = Size(112, 27)
+    btn_full_after.Cursor = Cursors.Hand
+    pnl_top.Controls.Add(btn_full_after)
+
+    # --- ЦЕНТРАЛЬНЫЙ ХОЛСТ НАЛОЖЕНИЯ ДВУХ ИЗОБРАЖЕНИЙ СО ШТОРКОЙ ---
+    pic_canvas = PictureBox()
+    pic_canvas.SizeMode = PictureBoxSizeMode.Normal
+    pic_canvas.BackColor = Color.FromArgb(15, 23, 42)
+    pic_canvas.Cursor = Cursors.SizeWE
+    form.Controls.Add(pic_canvas)
+
+    # --- НИЖНЯЯ ПАНЕЛЬ С ПОЛЗУНКОМ И КНОПКОЙ ВЫХОДА ---
+    pnl_bottom = Panel()
+    pnl_bottom.BackColor = Color.FromArgb(30, 41, 59)
+    pnl_bottom.Location = Point(0, 720)
+    pnl_bottom.Size = Size(1240, 82)
+    form.Controls.Add(pnl_bottom)
+
+    btn_only_after = Button()
+    btn_only_after.Text = u"◀ СТАЛО"
+    btn_only_after.FlatStyle = FlatStyle.Flat
+    btn_only_after.FlatAppearance.BorderColor = Color.FromArgb(71, 85, 105)
+    btn_only_after.BackColor = Color.FromArgb(51, 65, 85)
+    btn_only_after.ForeColor = Color.White
+    btn_only_after.Font = font_small
+    btn_only_after.Location = Point(16, 8)
+    btn_only_after.Size = Size(112, 26)
+    btn_only_after.Cursor = Cursors.Hand
+    pnl_bottom.Controls.Add(btn_only_after)
+
+    btn_center_split = Button()
+    btn_center_split.Text = u"50% | 50%"
+    btn_center_split.FlatStyle = FlatStyle.Flat
+    btn_center_split.FlatAppearance.BorderColor = Color.FromArgb(16, 185, 129)
+    btn_center_split.BackColor = Color.FromArgb(16, 185, 129)
+    btn_center_split.ForeColor = Color.White
+    btn_center_split.Font = font_small
+    btn_center_split.Location = Point(134, 8)
+    btn_center_split.Size = Size(76, 26)
+    btn_center_split.Cursor = Cursors.Hand
+    pnl_bottom.Controls.Add(btn_center_split)
+
+    btn_only_before = Button()
+    btn_only_before.Text = u"БЫЛО ▶"
+    btn_only_before.FlatStyle = FlatStyle.Flat
+    btn_only_before.FlatAppearance.BorderColor = Color.FromArgb(71, 85, 105)
+    btn_only_before.BackColor = Color.FromArgb(51, 65, 85)
+    btn_only_before.ForeColor = Color.White
+    btn_only_before.Font = font_small
+    btn_only_before.Location = Point(216, 8)
+    btn_only_before.Size = Size(102, 26)
+    btn_only_before.Cursor = Cursors.Hand
+    pnl_bottom.Controls.Add(btn_only_before)
+
+    lbl_slider_val = Label()
+    lbl_slider_val.Text = u"50%"
+    lbl_slider_val.ForeColor = Color.FromArgb(148, 163, 184)
+    lbl_slider_val.Font = font_small
+    lbl_slider_val.Location = Point(328, 12)
+    lbl_slider_val.Size = Size(430, 20)
+    pnl_bottom.Controls.Add(lbl_slider_val)
+
+    slider = TrackBar()
+    slider.Minimum = 0
+    slider.Maximum = 1000
+    slider.Value = 500
+    slider.TickStyle = getattr(TickStyle, "None", TickStyle.BottomRight)
+    slider.AutoSize = False
+    slider.BackColor = Color.FromArgb(30, 41, 59)
+    slider.Location = Point(760, 7)
+    slider.Size = Size(460, 28)
+    slider.Cursor = Cursors.Hand
+    pnl_bottom.Controls.Add(slider)
 
     lbl_prompt = Label()
     lbl_prompt.Text = u"Промпт: " + u_str(prompt_text)
-    lbl_prompt.Font = Font("Segoe UI", 9.0, FontStyle.Regular)
-    lbl_prompt.ForeColor = Color.FromArgb(71, 85, 105)
-    form.Controls.Add(lbl_prompt)
+    lbl_prompt.ForeColor = Color.FromArgb(203, 213, 225)
+    lbl_prompt.Font = font_small
+    lbl_prompt.Location = Point(16, 42)
+    lbl_prompt.Size = Size(1040, 32)
+    pnl_bottom.Controls.Add(lbl_prompt)
 
     btn_close = Button()
     btn_close.Text = u"EXIT | ВЫХОД"
     btn_close.FlatStyle = FlatStyle.Flat
-    btn_close.BackColor = Color.FromArgb(15, 23, 42)
+    btn_close.BackColor = Color.FromArgb(220, 38, 38)
     btn_close.ForeColor = Color.White
-    btn_close.Font = Font("Segoe UI", 9.5, FontStyle.Bold)
+    btn_close.Font = font_bold
+    btn_close.Size = Size(156, 34)
     btn_close.Cursor = Cursors.Hand
     btn_close.Click += lambda s, a: form.Close()
-    form.Controls.Add(btn_close)
+    pnl_bottom.Controls.Add(btn_close)
+
+    state = {
+        "before_orig": load_image_unlocked(valid_inputs[0][1]),
+        "after_orig": load_image_unlocked(after_path),
+        "before_title": valid_inputs[0][0],
+        "before_path": valid_inputs[0][1],
+        "scaled_before": None,
+        "scaled_after": None,
+        "comp_bmp": None,
+        "draw_x": 0,
+        "draw_y": 0,
+        "draw_w": 100,
+        "draw_h": 100,
+        "split_ratio": 0.5,
+        "dragging": False,
+        "updating_slider": False,
+    }
+
+    def _dispose_scaled_cache():
+        for k in ("scaled_before", "scaled_after"):
+            if state[k] is not None:
+                try:
+                    state[k].Dispose()
+                except Exception:
+                    pass
+                state[k] = None
+
+    def _rebuild_scaled_cache():
+        """Пересчитывает масштабированные копии ДО и ПОСЛЕ при изменении размера окна или смене кадра."""
+        _dispose_scaled_cache()
+        cw = max(100, pic_canvas.Width)
+        ch = max(100, pic_canvas.Height)
+
+        ref_img = state["after_orig"] or state["before_orig"]
+        if ref_img is None:
+            return
+
+        iw = max(1, ref_img.Width)
+        ih = max(1, ref_img.Height)
+        pad_x = 20
+        pad_y = 16
+        avail_w = max(80, cw - pad_x * 2)
+        avail_h = max(80, ch - pad_y * 2)
+
+        scale = min(float(avail_w) / float(iw), float(avail_h) / float(ih))
+        dw = max(40, int(round(iw * scale)))
+        dh = max(40, int(round(ih * scale)))
+        dx = int((cw - dw) // 2)
+        dy = int((ch - dh) // 2)
+
+        state["draw_x"] = dx
+        state["draw_y"] = dy
+        state["draw_w"] = dw
+        state["draw_h"] = dh
+
+        if state["before_orig"] is not None:
+            state["scaled_before"] = create_scaled_bitmap(state["before_orig"], dw, dh)
+        if state["after_orig"] is not None:
+            state["scaled_after"] = create_scaled_bitmap(state["after_orig"], dw, dh)
+
+        if state["comp_bmp"] is None or state["comp_bmp"].Width != cw or state["comp_bmp"].Height != ch:
+            old_bmp = state["comp_bmp"]
+            state["comp_bmp"] = Bitmap(cw, ch)
+            pic_canvas.Image = state["comp_bmp"]
+            if old_bmp is not None:
+                try:
+                    old_bmp.Dispose()
+                except Exception:
+                    pass
+
+    def _render_split_frame():
+        """Мгновенно отрисовывает наложение ДО (слева от ползунка) и ПОСЛЕ (справа от ползунка)."""
+        if state["comp_bmp"] is None:
+            _rebuild_scaled_cache()
+        bmp = state["comp_bmp"]
+        if bmp is None:
+            return
+
+        dx = state["draw_x"]
+        dy = state["draw_y"]
+        dw = state["draw_w"]
+        dh = state["draw_h"]
+        ratio = max(0.0, min(1.0, float(state["split_ratio"])))
+        split_px = int(round(dw * ratio))
+        line_x = dx + split_px
+
+        g = Graphics.FromImage(bmp)
+        try:
+            try:
+                g.SmoothingMode = SmoothingMode.AntiAlias
+            except Exception:
+                pass
+
+            g.Clear(Color.FromArgb(15, 23, 42))
+
+            # 1. Рисуем базовый слой — изображение «ПОСЛЕ» (Результат AI) целиком
+            if state["scaled_after"] is not None:
+                g.DrawImage(state["scaled_after"], dx, dy)
+            elif state["scaled_before"] is not None:
+                g.DrawImage(state["scaled_before"], dx, dy)
+
+            # 2. Поверх него в левой области [0 .. split_px] рисуем выбранный кадр «ДО»
+            if state["scaled_before"] is not None and split_px > 0:
+                g.SetClip(Rectangle(dx, dy, split_px, dh))
+                g.DrawImage(state["scaled_before"], dx, dy)
+                g.ResetClip()
+
+            # 3. Рамка вокруг области изображения
+            pen_border = Pen(Color.FromArgb(71, 85, 105), 1.0)
+            g.DrawRectangle(pen_border, dx, dy, dw - 1, dh - 1)
+            pen_border.Dispose()
+
+            # 4. Вертикальная линия разделителя (шторки) и круглая ручка ползунка
+            pen_shadow = Pen(Color.FromArgb(170, 0, 0, 0), 4.0)
+            g.DrawLine(pen_shadow, line_x, dy, line_x, dy + dh)
+            pen_shadow.Dispose()
+
+            pen_line = Pen(Color.White, 2.0)
+            g.DrawLine(pen_line, line_x, dy, line_x, dy + dh)
+
+            cy = dy + dh // 2
+            knob_r = 18
+            knob_rect = Rectangle(line_x - knob_r, cy - knob_r, knob_r * 2, knob_r * 2)
+            br_knob = SolidBrush(Color.FromArgb(16, 185, 129))
+            g.FillEllipse(br_knob, knob_rect)
+            br_knob.Dispose()
+            g.DrawEllipse(pen_line, knob_rect)
+
+            g.DrawLine(pen_line, line_x - 3, cy - 5, line_x - 9, cy)
+            g.DrawLine(pen_line, line_x - 9, cy, line_x - 3, cy + 5)
+            g.DrawLine(pen_line, line_x + 3, cy - 5, line_x + 9, cy)
+            g.DrawLine(pen_line, line_x + 9, cy, line_x + 3, cy + 5)
+            pen_line.Dispose()
+
+            # 5. Плашки-подписи «ДО» (слева вверху) и «ПОСЛЕ» (справа вверху)
+            br_badge_bg = SolidBrush(Color.FromArgb(195, 15, 23, 42))
+            br_badge_after = SolidBrush(Color.FromArgb(210, 5, 150, 105))
+            br_white = SolidBrush(Color.White)
+
+            if split_px > 95:
+                lbl_left_text = u"ДО: " + state["before_title"]
+                if len(lbl_left_text) > 34:
+                    lbl_left_text = lbl_left_text[:31] + u"..."
+                badge_w = min(split_px - 16, max(110, len(lbl_left_text) * 7 + 18))
+                g.FillRectangle(br_badge_bg, dx + 10, dy + 10, badge_w, 26)
+                g.DrawString(lbl_left_text, font_badge, br_white, float(dx + 16), float(dy + 14))
+
+            if (dw - split_px) > 95:
+                lbl_right_text = u"ПОСЛЕ: AI Render"
+                badge_rw = 142
+                rx = dx + dw - badge_rw - 10
+                if rx > line_x + 8:
+                    g.FillRectangle(br_badge_after, rx, dy + 10, badge_rw, 26)
+                    g.DrawString(lbl_right_text, font_badge, br_white, float(rx + 10), float(dy + 14))
+
+            br_badge_bg.Dispose()
+            br_badge_after.Dispose()
+            br_white.Dispose()
+        finally:
+            g.Dispose()
+
+        pct = int(round(ratio * 100))
+        lbl_slider_val.Text = u"{}% ДО  |  {}% ПОСЛЕ".format(
+            pct, 100 - pct
+        )
+        pic_canvas.Invalidate()
+
+    def _set_split_ratio(new_ratio, sync_trackbar=True):
+        r = max(0.0, min(1.0, float(new_ratio)))
+        state["split_ratio"] = r
+        if sync_trackbar:
+            state["updating_slider"] = True
+            try:
+                slider.Value = int(round(r * 1000))
+            except Exception:
+                pass
+            state["updating_slider"] = False
+        _render_split_frame()
+
+    def _update_from_mouse_x(mouse_x):
+        dw = max(1, state["draw_w"])
+        rel = float(mouse_x - state["draw_x"]) / float(dw)
+        _set_split_ratio(rel, sync_trackbar=True)
+
+    def _on_canvas_mouse_down(sender, e):
+        if e.Button == MouseButtons.Left:
+            state["dragging"] = True
+            _update_from_mouse_x(e.X)
+
+    def _on_canvas_mouse_move(sender, e):
+        if state["dragging"] or e.Button == MouseButtons.Left:
+            _update_from_mouse_x(e.X)
+
+    def _on_canvas_mouse_up(sender, e):
+        state["dragging"] = False
+
+    pic_canvas.MouseDown += _on_canvas_mouse_down
+    pic_canvas.MouseMove += _on_canvas_mouse_move
+    pic_canvas.MouseUp += _on_canvas_mouse_up
+
+    def _on_slider_scroll(sender, args):
+        if state["updating_slider"]:
+            return
+        _set_split_ratio(float(slider.Value) / 1000.0, sync_trackbar=False)
+
+    slider.ValueChanged += _on_slider_scroll
+
+    btn_only_after.Click += lambda s, a: _set_split_ratio(0.0, sync_trackbar=True)
+    btn_center_split.Click += lambda s, a: _set_split_ratio(0.5, sync_trackbar=True)
+    btn_only_before.Click += lambda s, a: _set_split_ratio(1.0, sync_trackbar=True)
+
+    def _on_input_combo_changed(sender, args):
+        idx = cmb_input.SelectedIndex
+        if idx < 0 or idx >= len(valid_inputs):
+            return
+        sel_title, sel_path = valid_inputs[idx]
+        if not sel_path or not File.Exists(sel_path):
+            return
+        new_bmp = load_image_unlocked(sel_path)
+        if new_bmp is not None:
+            if state["before_orig"] is not None:
+                try:
+                    state["before_orig"].Dispose()
+                except Exception:
+                    pass
+            state["before_orig"] = new_bmp
+            state["before_title"] = sel_title
+            state["before_path"] = sel_path
+            _rebuild_scaled_cache()
+            _render_split_frame()
+
+    cmb_input.SelectedIndexChanged += _on_input_combo_changed
+
+    def _on_pick_custom_compare_file(sender, args):
+        dlg = OpenFileDialog()
+        dlg.Title = u"Выберите изображение «ДО» для сравнения с результатом AI"
+        dlg.Filter = u"Изображения (*.png;*.jpg;*.jpeg;*.bmp;*.webp)|*.png;*.jpg;*.jpeg;*.bmp;*.webp|Все файлы (*.*)|*.*"
+        if state["before_path"] and File.Exists(state["before_path"]):
+            try:
+                dlg.InitialDirectory = Path.GetDirectoryName(state["before_path"])
+            except Exception:
+                pass
+        if dlg.ShowDialog() == DialogResult.OK:
+            f_path = u_str(dlg.FileName)
+            f_label = u"Файл: " + Path.GetFileName(f_path)
+            valid_inputs.append([f_label, f_path])
+            cmb_input.Items.Add(f_label)
+            cmb_input.SelectedIndex = cmb_input.Items.Count - 1
+
+    btn_add_file.Click += _on_pick_custom_compare_file
+
+    btn_full_before.Click += lambda s, a: show_full_image_window(
+        state["before_path"], u"ДО: " + state["before_title"], state["before_orig"]
+    )
+    btn_full_after.Click += lambda s, a: show_full_image_window(
+        after_path, u"ПОСЛЕ: " + after_label, state["after_orig"]
+    )
 
     def _layout_cmp(s=None, a=None):
         cw = form.ClientSize.Width
         ch = form.ClientSize.Height
-        pad = 18
-        gap = 14
-        n_cols = max(1, len(col_widgets))
-        col_w = int((cw - pad * 2 - gap * (n_cols - 1)) / n_cols)
-        img_h = max(200, ch - 120)
-        for i, (lbl_w, pic_w) in enumerate(col_widgets):
-            cx = pad + i * (col_w + gap)
-            lbl_w.Location = Point(cx, 14)
-            lbl_w.Size = Size(col_w, 24)
-            pic_w.Location = Point(cx, 42)
-            pic_w.Size = Size(col_w, img_h)
-        bottom_y = 42 + img_h + 14
-        lbl_prompt.Location = Point(pad, bottom_y)
-        lbl_prompt.Size = Size(max(200, cw - pad * 2 - 170), 42)
-        btn_close.Location = Point(cw - pad - 150, bottom_y)
-        btn_close.Size = Size(150, 36)
+        if cw < 300 or ch < 300:
+            return
+        top_h = 50
+        bot_h = 82
+        canvas_h = max(120, ch - top_h - bot_h)
+
+        pnl_top.Location = Point(0, 0)
+        pnl_top.Size = Size(cw, top_h)
+        btn_full_after.Location = Point(cw - 16 - 112, 11)
+        btn_full_before.Location = Point(btn_full_after.Location.X - 8 - 98, 11)
+        lbl_vs.Size = Size(max(140, btn_full_before.Location.X - 640), 22)
+
+        pic_canvas.Location = Point(0, top_h)
+        pic_canvas.Size = Size(cw, canvas_h)
+
+        pnl_bottom.Location = Point(0, top_h + canvas_h)
+        pnl_bottom.Size = Size(cw, bot_h)
+
+        slider_x = 740
+        slider_w = max(180, cw - slider_x - 18)
+        slider.Location = Point(slider_x, 7)
+        slider.Size = Size(slider_w, 28)
+
+        btn_close.Location = Point(cw - 16 - 156, 40)
+        lbl_prompt.Size = Size(max(200, btn_close.Location.X - 28), 34)
+
+        _rebuild_scaled_cache()
+        _render_split_frame()
 
     def _on_cmp_closed(s, a):
-        for _, pic_w in col_widgets:
-            try:
-                if pic_w.Image is not None:
-                    pic_w.Image.Dispose()
-            except Exception:
-                pass
+        _dispose_scaled_cache()
+        for k in ("before_orig", "after_orig", "comp_bmp"):
+            if state[k] is not None:
+                try:
+                    state[k].Dispose()
+                except Exception:
+                    pass
+                state[k] = None
 
     form.Resize += _layout_cmp
     form.FormClosed += _on_cmp_closed
@@ -1211,11 +1943,12 @@ def show_comparison_window(input_items, res_path, view_label, prompt_text, model
     form.Show()
 
 
+# USER INTERFACE
 # ==============================================================================
 # 8. ГЛАВНОЕ ОКНО СТУДИИ (v3.0 — 3 УНИВЕРСАЛЬНЫХ СЛОТА: ВИД REVIT ИЛИ ФАЙЛ)
 # ==============================================================================
 
-NONE_VIEW_LABEL = u"— [Не выбран / Выберите вид или файл] —"
+NONE_VIEW_LABEL = u"Выберите вид модели или укажите внешний путь"
 
 
 class ChutesRevitStudioForm(Form):
@@ -1240,13 +1973,6 @@ class ChutesRevitStudioForm(Form):
         self._is_initializing = True
         self._suppress_slot_events = False
 
-        # Состояние каждого из 3 универсальных входных слотов (индексы 0, 1, 2):
-        # source_type: "none" | "view" | "file"
-        # view_id: int (ID вида Revit, если выбран вид)
-        # view_obj: View (ссылка на вид Revit)
-        # view_name: str (имя вида)
-        # file_path: str (путь к пользовательскому файлу, если выбран файл с диска)
-        # preview_path: str (путь к актуальному PNG/JPG кадру этого слота)
         self.slots = [
             {
                 "index": 0,
@@ -1261,7 +1987,7 @@ class ChutesRevitStudioForm(Form):
             },
             {
                 "index": 1,
-                "title": u"Кадр 2 (Доп. вид / Скрытая линия / Файл)",
+                "title": u"Кадр 2 (Дополнительный)",
                 "enabled": False,
                 "source_type": "none",
                 "view_id": -1,
@@ -1272,7 +1998,7 @@ class ChutesRevitStudioForm(Form):
             },
             {
                 "index": 2,
-                "title": u"Кадр 3 (Референс / Вид / Файл)",
+                "title": u"Кадр 3 (Дополнительный)",
                 "enabled": False,
                 "source_type": "none",
                 "view_id": -1,
@@ -1283,7 +2009,6 @@ class ChutesRevitStudioForm(Form):
             },
         ]
 
-        # Для совместимости с выходами OUT нода Dynamo
         self.source_image_path = u""
         self.result_image_path = u""
         self.status_message = u"Окно студии v3.0 открыто (немодальный режим — можно параллельно работать в Revit)."
@@ -1302,7 +2027,6 @@ class ChutesRevitStudioForm(Form):
             except Exception:
                 pass
 
-        # Палитра
         self.col_bg = Color.FromArgb(246, 248, 250)
         self.col_card = Color.FromArgb(255, 255, 255)
         self.col_dark = Color.FromArgb(15, 23, 42)
@@ -1326,7 +2050,6 @@ class ChutesRevitStudioForm(Form):
 
         self.tooltip = ToolTip()
 
-        # Контролы слотов (списки для удобного доступа по индексу 0..2)
         self.slot_combos = []
         self.slot_file_btns = []
         self.slot_clear_btns = []
@@ -1384,7 +2107,7 @@ class ChutesRevitStudioForm(Form):
         init_slot2_in,
         init_slot3_in,
     ):
-        self.Text = u"AI Render Studio v3.0 — Revit 2020 / 2022 (Chutes.ai • 3 универсальных слота)"
+        self.Text = u"AI Render Studio"
         self.Size = Size(1220, 890)
         self.MinimumSize = Size(1040, 810)
         self.FormBorderStyle = FormBorderStyle.Sizable
@@ -1401,7 +2124,7 @@ class ChutesRevitStudioForm(Form):
         self.Controls.Add(self.pnl_header)
 
         self.lbl_app_title = Label()
-        self.lbl_app_title.Text = u"REVIT 3D  ×  CHUTES.AI  |  AI RENDER STUDIO v3.0"
+        self.lbl_app_title.Text = u"AI RENDER STUDIO"
         self.lbl_app_title.Location = Point(20, 13)
         self.lbl_app_title.Size = Size(520, 24)
         self.lbl_app_title.Font = self.font_title
@@ -1409,7 +2132,7 @@ class ChutesRevitStudioForm(Form):
         self.pnl_header.Controls.Add(self.lbl_app_title)
 
         self.lbl_app_sub = Label()
-        self.lbl_app_sub.Text = u"3 универсальных слота (любой 3D-вид Revit или файл с диска)  •  Параллельная работа с Revit"
+        self.lbl_app_sub.Text = u"v 3.0"
         self.lbl_app_sub.Location = Point(540, 16)
         self.lbl_app_sub.Size = Size(650, 20)
         self.lbl_app_sub.Font = self.font_reg
@@ -1494,7 +2217,7 @@ class ChutesRevitStudioForm(Form):
 
         self.btn_fetch_models = self._create_button(
             self.card_conn,
-            u"Подключить и загрузить модели изображений  →",
+            u"Подключить модели изображений —>",
             14,
             139,
             510,
@@ -1573,14 +2296,13 @@ class ChutesRevitStudioForm(Form):
         self.card_view = self._create_card(18, 272, 550, 412)
 
         self.lbl_sec3 = Label()
-        self.lbl_sec3.Text = u"3. ИСТОЧНИКИ КАДРОВ (1..3: ВИД REVIT ИЛИ ФАЙЛ) И ПАРАМЕТРЫ"
+        self.lbl_sec3.Text = u"3. ИСТОЧНИКИ КАДРОВ И ПАРАМЕТРЫ"
         self.lbl_sec3.Location = Point(14, 10)
         self.lbl_sec3.Size = Size(520, 20)
         self.lbl_sec3.Font = self.font_sec
         self.lbl_sec3.ForeColor = self.col_dark
         self.card_view.Controls.Add(self.lbl_sec3)
 
-        # Строка поиска видов Revit + галочка 2D-видов
         lbl_search_v = Label()
         lbl_search_v.Text = u"Поиск вида:"
         lbl_search_v.Location = Point(14, 36)
@@ -1607,7 +2329,7 @@ class ChutesRevitStudioForm(Form):
         self.btn_clear_search.Click += self._on_clear_view_search
 
         self.chk_all_views = CheckBox()
-        self.chk_all_views.Text = u"+ 2D-виды/планы"
+        self.chk_all_views.Text = u"2D-виды/планы"
         self.chk_all_views.Location = Point(368, 36)
         self.chk_all_views.Size = Size(165, 20)
         self.chk_all_views.Font = self.font_small
@@ -1615,7 +2337,6 @@ class ChutesRevitStudioForm(Form):
         self.chk_all_views.CheckedChanged += self._on_toggle_all_views
         self.card_view.Controls.Add(self.chk_all_views)
 
-        # 3 универсальные строки выбора источника для Кадра 1, Кадра 2 и Кадра 3
         self.slot_row_labels = []
         slot_short_names = [u"Кадр 1:", u"Кадр 2:", u"Кадр 3:"]
         for s_idx in range(3):
@@ -1672,7 +2393,6 @@ class ChutesRevitStudioForm(Form):
             self.tooltip.SetToolTip(btn_clr, u"Очистить/отключить слот {}".format(s_idx + 1))
             self.slot_clear_btns.append(btn_clr)
 
-        # Промпт
         self.lbl_pr = Label()
         self.lbl_pr.Text = u"Промпт (описание рендера / изменений на английском или русском):"
         self.lbl_pr.Location = Point(14, 160)
@@ -1693,7 +2413,6 @@ class ChutesRevitStudioForm(Form):
         )
         self.card_view.Controls.Add(self.txt_prompt)
 
-        # Размер и шаги
         self.lbl_sz = Label()
         self.lbl_sz.Text = u"Макс. сторона (px):"
         self.lbl_sz.Location = Point(14, 286)
@@ -1737,7 +2456,6 @@ class ChutesRevitStudioForm(Form):
         self.lbl_st_hint.ForeColor = self.col_muted
         self.card_view.Controls.Add(self.lbl_st_hint)
 
-        # Папка сохранения рендеров
         self.lbl_dir = Label()
         self.lbl_dir.Text = u"Папка рендеров:"
         self.lbl_dir.Location = Point(14, 318)
@@ -1759,7 +2477,6 @@ class ChutesRevitStudioForm(Form):
         self.btn_browse_dir.Font = self.font_small
         self.btn_browse_dir.Click += self._on_browse_out_dir
 
-        # Кнопка запуска: START | НАЧАТЬ
         self.btn_generate = self._create_button(
             self.card_view,
             u"START | НАЧАТЬ",
@@ -1781,7 +2498,7 @@ class ChutesRevitStudioForm(Form):
         self.card_prev = self._create_card(582, 272, 604, 412)
 
         self.lbl_sec4 = Label()
-        self.lbl_sec4.Text = u"4. ПРЕВЬЮ КАДРОВ (1..3) И РЕЗУЛЬТАТ AI (КЛИК — УВЕЛИЧИТЬ)"
+        self.lbl_sec4.Text = u"4. ПРЕВЬЮ КАДРОВ И РЕЗУЛЬТАТ РЕНДЕРА"
         self.lbl_sec4.Location = Point(14, 10)
         self.lbl_sec4.Size = Size(440, 20)
         self.lbl_sec4.Font = self.font_sec
@@ -1900,7 +2617,7 @@ class ChutesRevitStudioForm(Form):
         # КНОПКА ВЫХОДА ВНИЗУ СПРАВА ПОД ВСЕМИ БЛОКАМИ: "EXIT | ВЫХОД"
         # ======================================================================
         self.lbl_bottom_hint = Label()
-        self.lbl_bottom_hint.Text = u"Окно работает параллельно с Revit — для каждого из 3 слотов можно выбрать свой вид Revit или картинку с диска."
+        self.lbl_bottom_hint.Text = u"Created by  Alexander Iskra [github.com/alxiskra]"
         self.lbl_bottom_hint.Location = Point(20, 810)
         self.lbl_bottom_hint.Size = Size(920, 24)
         self.lbl_bottom_hint.Font = self.font_small
@@ -2151,7 +2868,7 @@ class ChutesRevitStudioForm(Form):
         if active_parts:
             summary_str = u"  |  ".join(active_parts)
         else:
-            summary_str = u"нет активных кадров (режим Txt2Img)"
+            summary_str = u"нет кадров для отправки (используй модель Txt2Img)"
         self.lbl_preview_meta.Text = u"Активные кадры ({}/3): {}".format(len(active_parts), summary_str)
 
     # --------------------------------------------------------------------------
@@ -2261,7 +2978,7 @@ class ChutesRevitStudioForm(Form):
         self.lbl_models_status.Text = u"Моделей: {} ({})".format(len(self.available_models), note)
         if not auto_startup:
             self.log_step(
-                u"Список моделей обновлён ({} шт.).".format(len(self.available_models)),
+                u"Список моделей обновлён ({} шт., источник: {}).".format(len(self.available_models), note),
                 progress_val=0,
                 status_color=self.col_success,
             )
@@ -2289,7 +3006,6 @@ class ChutesRevitStudioForm(Form):
     # --------------------------------------------------------------------------
     def _init_all_slots(self, init_slot1_in, init_slot2_in, init_slot3_in):
         """Настраивает стартовые значения всех 3 слотов при открытии окна."""
-        # По умолчанию для Слота 1 берем первый доступный (активный) 3D-вид проекта, если не задан вход IN[1]
         if init_slot1_in is not None:
             self._apply_initial_input_to_slot(0, init_slot1_in, default_to_first_view=True)
         elif len(self.all_views) > 0:
@@ -2302,10 +3018,8 @@ class ChutesRevitStudioForm(Form):
         if init_slot3_in is not None:
             self._apply_initial_input_to_slot(2, init_slot3_in, default_to_first_view=False)
 
-        # Заполняем выпадающие списки всех 3 слотов
         self._rebuild_all_slot_combos()
 
-        # Рендерим стартовые превью для активных слотов
         for s_idx in range(3):
             if self.slots[s_idx]["enabled"] and self.slots[s_idx]["source_type"] in ("view", "file"):
                 self._refresh_slot_preview(s_idx)
@@ -2428,9 +3142,9 @@ class ChutesRevitStudioForm(Form):
             )
         else:
             default_titles = [
-                u"1. Кадр 1 (Основной вид / файл)",
-                u"2. Кадр 2 (Доп. вид / контуры / файл)",
-                u"3. Кадр 3 (Референс / вид / файл)",
+                u"1. Кадр 1 (Основной)",
+                u"2. Кадр 2 (Дополнительный)",
+                u"3. Кадр 3 (Дополнительный)",
             ]
             self.slot_checkboxes[s_idx].Text = default_titles[s_idx]
 
@@ -2446,12 +3160,10 @@ class ChutesRevitStudioForm(Form):
         self._suppress_slot_events = True
         try:
             cmb.Items.Clear()
-            # Позиция 0 — всегда «Не выбран»
             cmb.Items.Add(NONE_VIEW_LABEL)
 
             selected_combo_idx = 0
 
-            # Если для слота выбран внешний файл с диска, добавляем его строку следующей позицией
             file_item_offset = 0
             if slot["source_type"] == "file" and slot["file_path"]:
                 file_label = u"📁 [Файл] " + Path.GetFileName(slot["file_path"])
@@ -2464,7 +3176,6 @@ class ChutesRevitStudioForm(Form):
                 if slot["source_type"] == "view" and get_element_id_int(v_item["view"].Id) == slot["view_id"]:
                     selected_combo_idx = 1 + file_item_offset + i
 
-            # Если выбранный вид отфильтрован строкой поиска, всё равно показываем его в списке, чтобы выбор не сбрасывался
             if (
                 slot["source_type"] == "view"
                 and slot["view_id"] != -1
@@ -2590,7 +3301,6 @@ class ChutesRevitStudioForm(Form):
             if sel_text.startswith(u"📁 [Файл]") or sel_text.startswith(u"[Выбранный вид]"):
                 return
 
-            # Ищем выбранный вид по метке в filtered_views
             matched_v = None
             for v_item in self.filtered_views:
                 if u_str(v_item["label"]) == sel_text:
@@ -2622,7 +3332,6 @@ class ChutesRevitStudioForm(Form):
             slot = self.slots[s_idx]
             want_on = bool(chk.Checked)
             if want_on and slot["source_type"] == "none":
-                # Если источник для слота еще не задан — предлагаем выбрать файл (или пользователь может выбрать вид в списке)
                 picked = self._pick_file_for_slot(s_idx)
                 if not picked and slot["source_type"] == "none":
                     self._suppress_slot_events = True
@@ -2668,7 +3377,6 @@ class ChutesRevitStudioForm(Form):
         dlg.Title = u"Выберите изображение для Кадра {} (или выберите 3D-вид в выпадающем списке)".format(s_idx + 1)
         dlg.Filter = u"Изображения (*.png;*.jpg;*.jpeg;*.bmp;*.webp)|*.png;*.jpg;*.jpeg;*.bmp;*.webp|Все файлы (*.*)|*.*"
 
-        # По умолчанию открываем папку сохранения рендеров (или папку текущего файла слота)
         slot = self.slots[s_idx]
         init_dir = u""
         if slot["file_path"] and File.Exists(slot["file_path"]):
@@ -2711,7 +3419,10 @@ class ChutesRevitStudioForm(Form):
             self.txt_out_dir.Text = u_str(dlg.SelectedPath)
 
     def _on_open_compare_click(self, sender, args):
+        """Собирает все доступные кадры (1..3) для выбора в выпадающем списке окна шторки «До / После»."""
         inputs_for_cmp = []
+        seen_slots = set()
+
         for s_idx in range(3):
             slot = self.slots[s_idx]
             p_path = slot["preview_path"] or slot["file_path"]
@@ -2719,12 +3430,17 @@ class ChutesRevitStudioForm(Form):
                 inputs_for_cmp.append(
                     (u"Кадр {} ({})".format(s_idx + 1, self._get_slot_short_description(s_idx)), p_path)
                 )
-        if len(inputs_for_cmp) == 0:
-            for s_idx in range(3):
-                p_path = self.slots[s_idx]["preview_path"] or self.slots[s_idx]["file_path"]
-                if p_path and File.Exists(p_path):
-                    inputs_for_cmp.append((u"Кадр {}".format(s_idx + 1), p_path))
-                    break
+                seen_slots.add(s_idx)
+
+        for s_idx in range(3):
+            if s_idx in seen_slots:
+                continue
+            slot = self.slots[s_idx]
+            p_path = slot["preview_path"] or slot["file_path"]
+            if p_path and File.Exists(p_path):
+                inputs_for_cmp.append(
+                    (u"Кадр {} ({})".format(s_idx + 1, self._get_slot_short_description(s_idx)), p_path)
+                )
 
         if self.result_image_path and File.Exists(self.result_image_path):
             show_comparison_window(
@@ -2976,7 +3692,7 @@ class ChutesRevitStudioForm(Form):
                     "error": u_str(result_val),
                 }
                 self.log_step(
-                    u"Ошибка генерации (HTTP {}): {}".format(http_status, u_str(result_val)[:180]),
+                    u"Ошибка генерации (HTTP {}): {}".format(http_status, u_str(result_val)[:240]),
                     progress_val=0,
                     status_color=Color.FromArgb(220, 38, 38),
                 )
@@ -3015,7 +3731,6 @@ try:
 except Exception:
     init_steps = 4
 
-# Необязательные входы IN[7] и IN[8] для стартовой инициализации Кадра 2 и Кадра 3 (вид Revit или путь к файлу)
 init_slot2_in = get_input(7, None)
 init_slot3_in = get_input(8, None)
 
